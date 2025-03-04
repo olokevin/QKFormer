@@ -45,14 +45,18 @@ def get_args_parser():
     parser.add_argument('--epochs', default=200, type=int)
     parser.add_argument('--accum_iter', default=3, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
-    parser.add_argument('--finetune', default='/media/data/models/QKFormer-github/output_dir_qkformer_78.85/checkpoint-199.pth',
-                        help='finetune from checkpoint') #/media/data/models/output_dir_qkformer_84.29/checkpoint-191.pth
-    parser.add_argument('--data_path', default='/media/data/imagenet2012', type=str,
+    parser.add_argument('--finetune', default='./output_dir_qkformer_84.29/checkpoint-191.pth',
+                        help='finetune from checkpoint') 
+    # ./output_dir_qkformer_78.85/checkpoint-199.pth
+    # ./output_dir_qkformer_84.29/checkpoint-191.pth
+    
+    parser.add_argument('--data_path', default='/home/yequan_zhao/dataset/ImageNet2012', type=str,
                         help='dataset path')
 
     # Model parameters
-    parser.add_argument('--model', default='QKFormer_10_384', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='QKFormer_10_768', type=str, metavar='MODEL',
                         help='Name of model to train')
+    
     parser.add_argument('--time_step', default=4, type=int,
                         help='images input size')
     parser.add_argument('--input_size', default=224, type=int,

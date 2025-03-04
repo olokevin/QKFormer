@@ -12,6 +12,8 @@ import numpy as np
 import os
 import time
 from pathlib import Path
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "..")))
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -27,14 +29,26 @@ from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 
 import util.lr_decay_hst as lrd
 import util.misc as misc
-from util.datasets import build_dataset
+from util.datasets import build_dataset, build_imagenetc_dataset
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 import qkformer
 
 from engine_finetune import train_one_epoch, evaluate
 
+import yaml
+import shutil
+from util.logging import logger
+import easydict
+from ZO_Estim.ZO_Estim_entry import build_ZO_Estim
+
 def get_args_parser():
+    # The first arg parser parses out only the --config argument, this argument is used to
+    # load a yaml file containing key-values that override the defaults for the main parser below
+    config_parser = parser = argparse.ArgumentParser(description='Training Config', add_help=False)
+    parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
+                        help='YAML config file specifying default arguments') # imagenet.yml  cifar10.yml
+
     # important params
     parser = argparse.ArgumentParser('MAE fine-tuning for image classification', add_help=False)
     parser.add_argument('--batch_size', default=64, type=int,
@@ -42,14 +56,25 @@ def get_args_parser():
     parser.add_argument('--epochs', default=200, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
-    parser.add_argument('--finetune', default='',
+    parser.add_argument('--finetune', default='./output_dir_qkformer_84.29/checkpoint-191.pth',
                         help='finetune from checkpoint')
-    parser.add_argument('--data_path', default='/media/data/imagenet2012', type=str,
+    # ./output_dir_qkformer_78.85/checkpoint-199.pth
+    # ./output_dir_qkformer_82.08/checkpoint-196.pth
+    # ./output_dir_qkformer_84.29/checkpoint-191.pth
+    
+    parser.add_argument('--dataset', default='imagenet', type=str,
+                        help='dataset name')
+    
+    parser.add_argument('--data_path', default='/home/yequan_zhao/dataset/ImageNet2012', type=str,
                         help='dataset path')
 
     # Model parameters
-    parser.add_argument('--model', default='QKFormer_10_384', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='QKFormer_10_768', type=str, metavar='MODEL',
                         help='Name of model to train')
+    # QKFormer_10_384
+    # QKFormer_10_512
+    # QKFormer_10_768
+    
     parser.add_argument('--time_step', default=4, type=int,
                         help='images input size')
     parser.add_argument('--input_size', default=224, type=int,
@@ -151,14 +176,14 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
 
-    return parser
+    return config_parser, parser
 
 
 def main(args):
     misc.init_distributed_mode(args)
 
-    print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
-    print("{}".format(args).replace(', ', ',\n'))
+    logger.info('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
+    # logger.info("{}".format(args).replace(', ', ',\n'))
 
     device = torch.device(args.device)
 
@@ -169,8 +194,11 @@ def main(args):
 
     cudnn.benchmark = True
 
-    dataset_train = build_dataset(is_train=True, args=args)
-    dataset_val = build_dataset(is_train=False, args=args)
+    if args.dataset == 'imagenet-c':
+        dataset_train, dataset_val, dataset_test = build_imagenetc_dataset(args=args)
+    else:
+        dataset_train = build_dataset(is_train=True, args=args)
+        dataset_val = build_dataset(is_train=False, args=args)
 
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()
@@ -178,10 +206,10 @@ def main(args):
         sampler_train = torch.utils.data.DistributedSampler(
             dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
         )
-        print("Sampler_train = %s" % str(sampler_train))
+        logger.info("Sampler_train = %s" % str(sampler_train))
         if args.dist_eval:
             if len(dataset_val) % num_tasks != 0:
-                print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
+                logger.info('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
                       'This will slightly alter validation results as extra duplicate entries are added to achieve '
                       'equal num of samples per-process.')
             sampler_val = torch.utils.data.DistributedSampler(
@@ -218,7 +246,7 @@ def main(args):
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
     if mixup_active:
-        print("Mixup is activated!")
+        logger.info("Mixup is activated!")
         mixup_fn = Mixup(
             mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
@@ -226,24 +254,34 @@ def main(args):
 
     model = qkformer.__dict__[args.model](T=args.time_step
     )
+    
+    if args.eval:
+        checkpoint = torch.load(args.finetune, map_location='cpu')
+        logger.info("Load pre-trained checkpoint from: %s" % args.finetune)
+        checkpoint_model = checkpoint['model']
+        # load pre-trained model
+        msg = model.load_state_dict(checkpoint_model, strict=False)
+        logger.info(msg)
 
-    if args.finetune and not args.eval:
+    elif args.finetune:
         checkpoint = torch.load(args.finetune, map_location='cpu')
 
-        print("Load pre-trained checkpoint from: %s" % args.finetune)
+        logger.info("Load pre-trained checkpoint from: %s" % args.finetune)
         checkpoint_model = checkpoint['model']
-        state_dict = model.state_dict()
-        for k in ['head.weight', 'head.bias']:
-            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-                print(f"Removing key {k} from pretrained checkpoint")
-                del checkpoint_model[k]
+        
+        if getattr(args, 'new_head', True):
+            state_dict = model.state_dict()
+            for k in ['head.weight', 'head.bias']:
+                if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+                    logger.info(f"Removing key {k} from pretrained checkpoint")
+                    del checkpoint_model[k]
 
         # interpolate position embedding
         # interpolate_pos_embed(model, checkpoint_model)
 
         # load pre-trained model
         msg = model.load_state_dict(checkpoint_model, strict=False)
-        print(msg)
+        logger.info(msg)
 
         # if args.global_pool:
         #     assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
@@ -251,26 +289,27 @@ def main(args):
         #     assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
 
         # manually initialize fc layer
-        trunc_normal_(model.head.weight, std=2e-5)
+        if getattr(args, 'new_head', True):
+            trunc_normal_(model.head.weight, std=2e-5)
 
     model.to(device)
 
     model_without_ddp = model
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    print("Model = %s" % str(model_without_ddp))
-    print('number of params (M): %.2f' % (n_parameters / 1.e6))
+    # logger.info("Model = %s" % str(model_without_ddp))
+    logger.info('number of params (M): %.2f' % (n_parameters / 1.e6))
 
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
 
     if args.lr is None:  # only base_lr is specified
         args.lr = args.blr * eff_batch_size / 256
 
-    print("base lr: %.2e" % (args.lr * 256 / eff_batch_size))
-    print("actual lr: %.2e" % args.lr)
+    logger.info("base lr: %.2e" % (args.lr * 256 / eff_batch_size))
+    logger.info("actual lr: %.2e" % args.lr)
 
-    print("accumulate grad iterations: %d" % args.accum_iter)
-    print("effective batch size: %d" % eff_batch_size)
+    logger.info("accumulate grad iterations: %d" % args.accum_iter)
+    logger.info("effective batch size: %d" % eff_batch_size)
 
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
@@ -292,16 +331,50 @@ def main(args):
     else:
         criterion = torch.nn.CrossEntropyLoss()
 
-    print("criterion = %s" % str(criterion))
+    logger.info("criterion = %s" % str(criterion))
 
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
     if args.eval:
         test_stats = evaluate(data_loader_val, model, device)
-        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         exit(0)
+    
+    ############### Trainable Params ################
+    # for name, module in model.named_modules():
+    #     print(name, type(module))
+    
+    if hasattr(args, 'trainable_block_list'):
+        trainable_block_list = args.trainable_block_list
+        
+        for name, param in model.named_parameters():
+            if any([block in name for block in trainable_block_list]):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+            
+            if getattr(args, 'no_train_bn', False):
+                if '_bn' in name:
+                    param.requires_grad = False
+    
+    n_trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info('number of trainable params (M): %.2f' % (n_trainable_parameters / 1.e6))
 
-    print(f"Start training for {args.epochs} epochs")
+    ############### ZO Estim ################
+    if hasattr(args, 'ZO_Estim'):
+        args.ZO_Estim = easydict.EasyDict(args.ZO_Estim)
+        if args.ZO_Estim.en:
+            ZO_Estim = build_ZO_Estim(args.ZO_Estim, model=model, )
+        else:
+            ZO_Estim = None
+    else:
+        ZO_Estim = None
+    
+    ############### Training ################
+    # test_stats = evaluate(data_loader_val, model, device)
+    # logger.info(f"Initialization Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+    
+    logger.info(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     max_accuracy = 0.0
     for epoch in range(args.start_epoch, args.epochs):
@@ -312,11 +385,12 @@ def main(args):
             optimizer, device, epoch, loss_scaler,
             args.clip_grad, mixup_fn,
             log_writer=log_writer,
+            ZO_Estim=ZO_Estim,
             args=args
         )
         
         test_stats = evaluate(data_loader_val, model, device)
-        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
 
         if epoch > int(args.epochs - 20) and test_stats["acc1"] > max_accuracy:
             if args.output_dir:
@@ -325,7 +399,7 @@ def main(args):
                     loss_scaler=loss_scaler, epoch=epoch)
 
         max_accuracy = max(max_accuracy, test_stats["acc1"])
-        print(f'Max accuracy: {max_accuracy:.2f}%')
+        logger.info(f'Max accuracy: {max_accuracy:.2f}%')
 
         if log_writer is not None:
             log_writer.add_scalar('perf/test_acc1', test_stats['acc1'], epoch)
@@ -345,12 +419,41 @@ def main(args):
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+    logger.info('Training time {}'.format(total_time_str))
 
 
 if __name__ == '__main__':
-    args = get_args_parser()
-    args = args.parse_args()
+    # args = get_args_parser()
+    # args = args.parse_args()
+    
+    config_parser, parser = get_args_parser()
+    
+    # Do we have a config file to parse?
+    args_config, remaining = config_parser.parse_known_args()
+    if args_config.config:
+        with open(args_config.config, 'r') as f:
+            cfg = yaml.safe_load(f)
+            parser.set_defaults(**cfg)
+
+    # The main arg parser parses the rest of the args, the usual
+    # defaults will have been overridden if config file specified.
+    args = parser.parse_args(remaining)
+
+    # Cache the args as a text string to save them in the output dir later
+    args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
+    
     if args.output_dir:
+        args.output_dir = os.path.join(args.output_dir, str(os.getpid()))
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+        
+        if args_config.config:
+            run_dir_config_path = os.path.join(args.output_dir, "args.yml")
+            os.makedirs(os.path.dirname(run_dir_config_path), exist_ok=True)
+            shutil.copyfile(args_config.config, run_dir_config_path)
+    
+    # Setup logger
+    args.run_dir = args.output_dir
+    logger.init(args)  # dump exp config
+    logger.info(os.getpid())
+    
     main(args)

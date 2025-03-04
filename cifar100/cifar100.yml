@@ -5,7 +5,7 @@ num_heads: 8
 patch_size: 4
 mlp_ratio: 4
 #data_dir: ./torch/cifar100/
-data_dir: /media/data/spike-transformer-network/torch/cifar100/
+data_dir: /home/yequan_zhao/dataset/
 dataset: torch/cifar100
 num_classes: 100
 img_size: 32

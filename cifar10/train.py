@@ -32,15 +32,26 @@ from torch.nn.parallel import DistributedDataParallel as NativeDDP
 
 from timm.data import create_dataset, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset, create_loader
 # from loader import create_loader
-from timm.models import create_model, safe_model_name, resume_checkpoint, load_checkpoint, \
-    convert_splitbn_model, model_parameters
+from timm.models import create_model, safe_model_name, resume_checkpoint, load_checkpoint, model_parameters
+from timm.models.layers import convert_splitbn_model
 from timm.utils import *
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy, JsdCrossEntropy
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler
 from timm.utils import ApexScaler, NativeScaler
 
-
+##### ZO
+from pathlib import Path
+import shutil
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "..")))
+from imagenet.util.logging import logger
+from imagenet.util.datasets import build_cifar10c_dataset
+import easydict
+from ZO_Estim.ZO_Estim_entry import build_ZO_Estim
+import torch.nn.functional as F
+from ZO_Estim.ZO_Estim_entry import build_obj_fn
+from ZO_Estim.ZO_utils import default_create_bwd_pre_hook_ZO_grad
 
 try:
     from apex import amp
@@ -288,7 +299,7 @@ parser.add_argument('--pin-mem', action='store_true', default=False,
                     help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
 parser.add_argument('--no-prefetcher', action='store_true', default=False,
                     help='disable fast prefetcher')
-parser.add_argument('--output', default='', type=str, metavar='PATH',
+parser.add_argument('--output', default='output/train', type=str, metavar='PATH',
                     help='path to output folder (default: none, current dir)')
 parser.add_argument('--experiment', default='', type=str, metavar='NAME',
                     help='name of train experiment, name of sub-folder for output')
@@ -304,6 +315,9 @@ parser.add_argument('--torchscript', dest='torchscript', action='store_true',
 parser.add_argument('--log-wandb', action='store_true', default=False,
                     help='log training and validation metrics to wandb')
 
+parser.add_argument('--eval', action='store_true',
+                        help='Perform evaluation only')
+
 
 def _parse_args():
     # Do we have a config file to parse?
@@ -316,6 +330,8 @@ def _parse_args():
     # The main arg parser parses the rest of the args, the usual
     # defaults will have been overridden if config file specified.
     args = parser.parse_args(remaining)
+    
+    args.config = args_config.config
 
     # Cache the args as a text string to save them in the output dir later
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
@@ -323,8 +339,23 @@ def _parse_args():
 
 
 def main():
-    setup_default_logging()
+    # setup_default_logging()
     args, args_text = _parse_args()
+    
+    # Setup logger
+    if args.output:
+        args.output_dir = os.path.join(args.output, str(os.getpid()))
+        os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
+        
+        if args.config:
+            run_dir_config_path = os.path.join(args.output_dir, "args.yml")
+            os.makedirs(os.path.dirname(run_dir_config_path), exist_ok=True)
+            shutil.copyfile(args.config, run_dir_config_path)
+            
+    args.run_dir = args.output_dir
+    logger.init(args)  # dump exp config
+    logger.info(os.getpid())
+    _logger = logger
 
     if args.log_wandb:
         if has_wandb:
@@ -373,17 +404,26 @@ def main():
     import model
 
     model = create_model(
-        "QKFormer",
-        pretrained=False,
-        drop_rate=0.,
-        drop_path_rate=0.2,
-        drop_block_rate=None,
-        img_size_h=args.img_size, img_size_w=args.img_size,
-        patch_size=args.patch_size, embed_dims=args.dim, num_heads=args.num_heads, mlp_ratios=args.mlp_ratio,
-        in_channels=3, num_classes=args.num_classes, qkv_bias=False,
-        depths=args.layer, sr_ratios=1,
-        T=args.time_step
-   )
+          "QKFormer",
+          pretrained=False,
+          drop_rate=0.,
+          drop_path_rate=0.2,
+          drop_block_rate=None,
+          img_size_h=args.img_size, img_size_w=args.img_size,
+          patch_size=args.patch_size, embed_dims=args.dim, num_heads=args.num_heads, mlp_ratios=args.mlp_ratio,
+          in_channels=3, num_classes=args.num_classes, qkv_bias=False,
+          depths=args.layer, sr_ratios=1,
+          T=args.time_step
+    )
+    
+    ####### load pretrained model #######
+    if args.initial_checkpoint:
+        checkpoint = torch.load(args.initial_checkpoint, map_location='cpu')
+        logger.info("Load pre-trained checkpoint from: %s" % args.initial_checkpoint)
+        checkpoint_model = checkpoint['state_dict']
+        # load pre-trained model
+        msg = model.load_state_dict(checkpoint_model, strict=False)
+        logger.info(msg)
 
 
     print("Creating model")
@@ -500,13 +540,16 @@ def main():
         _logger.info('Scheduled epochs: {}'.format(num_epochs))
 
     # create the train and eval datasets
-    dataset_train = create_dataset(
-        args.dataset,
-        root=args.data_dir, split=args.train_split, is_training=True,
-        batch_size=args.batch_size, repeats=args.epoch_repeats)
+    if args.dataset == 'cifar10-c':
+        dataset_train, dataset_eval, dataset_test = build_cifar10c_dataset(args=args)
+    else:
+        dataset_train = create_dataset(
+            args.dataset,
+            root=args.data_dir, split=args.train_split, is_training=True,
+            batch_size=args.batch_size, repeats=args.epoch_repeats)
 
-    dataset_eval = create_dataset(
-        args.dataset, root=args.data_dir, split=args.val_split, is_training=False, batch_size=args.batch_size)
+        dataset_eval = create_dataset(
+            args.dataset, root=args.data_dir, split=args.val_split, is_training=False, batch_size=args.batch_size)
 
     # setup mixup / cutmix
     collate_fn = None
@@ -586,28 +629,35 @@ def main():
     else:
         train_loss_fn = nn.CrossEntropyLoss().cuda()
     validate_loss_fn = nn.CrossEntropyLoss().cuda()
+    
+    
+    ##### eval
+    if args.eval:
+        eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
+        _logger.info(f"Accuracy of the network on the {len(dataset_eval)} test images: {eval_metrics['top1']:.2f}%")
+        exit(0)
 
     # setup checkpoint saver and eval metric tracking
     eval_metric = args.eval_metric
     best_metric = None
     best_epoch = None
     saver = None
-    output_dir = None
+    # output_dir = None
     if args.rank == 0:
-        if args.experiment:
-            exp_name = args.experiment
-        else:
-            exp_name = '-'.join([
-                datetime.now().strftime("%Y%m%d-%H%M%S"),
-                safe_model_name(args.model),
-                str(data_config['input_size'][-1])
-            ])
-        output_dir = get_outdir(args.output if args.output else './output/train', exp_name)
+        # if args.experiment:
+        #     exp_name = args.experiment
+        # else:
+        #     exp_name = '-'.join([
+        #         datetime.now().strftime("%Y%m%d-%H%M%S"),
+        #         safe_model_name(args.model),
+        #         str(data_config['input_size'][-1])
+        #     ])
+        # output_dir = get_outdir(args.output if args.output else './output/train', exp_name)
         decreasing = True if eval_metric == 'loss' else False
         saver = CheckpointSaver(
             model=model, optimizer=optimizer, args=args, model_ema=model_ema, amp_scaler=loss_scaler,
-            checkpoint_dir=output_dir, recovery_dir=output_dir, decreasing=decreasing, max_history=args.checkpoint_hist)
-        with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
+            checkpoint_dir=args.output_dir, recovery_dir=args.output_dir, decreasing=decreasing, max_history=args.checkpoint_hist)
+        with open(os.path.join(args.output_dir, 'args.yaml'), 'w') as f:
             f.write(args_text)
 
     try:
@@ -617,7 +667,7 @@ def main():
 
             train_metrics = train_one_epoch(
                 epoch, model, loader_train, optimizer, train_loss_fn, args,
-                lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
+                lr_scheduler=lr_scheduler, saver=saver, output_dir=args.output_dir,
                 amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn)
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
@@ -639,9 +689,9 @@ def main():
                 # step LR for next epoch
                 lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
 
-            if output_dir is not None:
+            if args.output_dir is not None:
                 update_summary(
-                    epoch, train_metrics, eval_metrics, os.path.join(output_dir, 'summary.csv'),
+                    epoch, train_metrics, eval_metrics, os.path.join(args.output_dir, 'summary.csv'),
                     write_header=best_metric is None, log_wandb=args.log_wandb and has_wandb)
 
             if saver is not None:

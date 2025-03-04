@@ -1,0 +1,131 @@
+batch_size: 20
+epochs: 50
+accum_iter: 1
+
+data_path: '/home/yequan_zhao/dataset/ImageNet2012'
+
+dataset: imagenet-c
+data_root: '/home/yequan_zhao/dataset'
+severity: 3
+train_n: 5000
+corruption_type: gaussian_noise
+# corruption_type: [gaussian_noise, shot_noise, impulse_noise, speckle_noise, defocus_blur, glass_blur, motion_blur, zoom_blur, snow, frost, fog, brightness, contrast, elastic_transform, pixelate, jpeg_compression]
+new_head: false
+
+# model: 'QKFormer_10_384'
+# finetune: './output_dir_qkformer_78.85/checkpoint-199.pth'
+
+model: 'QKFormer_10_512'
+finetune: './output_dir_qkformer_82.08/checkpoint-196.pth'
+
+# model: 'QKFormer_10_768'
+# finetune: './output_dir_qkformer_84.29/checkpoint-191.pth'
+
+time_step: 4
+input_size: 224
+drop_path: 0
+
+##### Optimizer
+clip_grad: null
+weight_decay: 0.05
+lr: null
+blr: 0.0006
+layer_decay: 1.0
+min_lr: 1e-6
+warmup_epochs: 1
+
+color_jitter: null
+aa: 'rand-m9-mstd0.5-inc1'
+smoothing: 0.1
+
+reprob: 0.25
+remode: 'pixel'
+recount: 1
+resplit: false
+
+mixup: 0
+cutmix: 0
+cutmix_minmax: null
+mixup_prob: 1.0
+mixup_switch_prob: 0.5
+mixup_mode: 'batch'
+
+global_pool: true
+cls_token: false
+
+nb_classes: 1000
+output_dir: './output_dir_qkformer'
+log_dir: './output_dir_qkformer'
+device: 'cuda'
+seed: 0
+resume: ''
+
+start_epoch: 0
+eval: false
+dist_eval: false
+num_workers: 10
+pin_mem: true
+no_pin_mem: false
+
+world_size: 1
+local_rank: -1
+dist_on_itp: false
+dist_url: 'env://'
+
+trainable_block_list: [
+    'patch_embed1.proj_conv',
+    # 'patch_embed1', 
+    # 'stage1', 
+    # 'patch_embed2',
+    # 'stage2',
+    # 'patch_embed3',
+    # 'stage3',
+    # 'head'
+]
+
+##### BN
+freeze_bn: false
+# freeze_bn: true
+
+# no_train_bn: false
+no_train_bn: true
+
+ZO_Estim:
+  en: false
+  # en: true
+  name: ZO_Estim_MC
+  sigma: 0.01
+  n_sample: 100
+  signsgd: false
+
+  # scale: null
+  scale: sqrt_dim
+  # scale: dim
+
+  ZO_trainable_layers_list: null
+
+  actv_perturb_block_idx_list: null
+  param_perturb_block_idx_list: all
+
+  # actv_perturb_block_idx_list: all
+  # param_perturb_block_idx_list: null
+  
+  obj_fn_type: classifier
+  # obj_fn_type: classifier_layerwise
+
+  estimate_method: forward
+  # estimate_method: antithetic
+
+  sample_method: gaussian
+  # sample_method: bernoulli
+  # sample_method: coord_basis
+
+  # en_layerwise_perturbation: true
+  en_layerwise_perturbation: false
+
+  # en_partial_forward: true
+  en_partial_forward: false
+
+  quantized: false
+  normalize_perturbation: false
+  en_param_commit: false
