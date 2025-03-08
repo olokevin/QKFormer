@@ -1,41 +1,15 @@
-initial_checkpoint: ./output/train/20250303-002544-vitsnn-32/model_best.pth.tar
-# initial_checkpoint: null
-
 epochs: 400
-batch_size: 64
-val_batch_size: 64
-lr: 1e-3
-min_lr: 1e-5
-sched: cosine
-weight_decay: 6e-2
-cooldown_epochs: 10
-warmup_epochs: 20
-warmup_lr: 0.00001
-opt: adamw
-smoothing: 0.1
-
 time_step: 4
 layer: 4
 dim: 384
 num_heads: 8
 patch_size: 4
 mlp_ratio: 4
-data_dir: /home/yequan_zhao/dataset/
-
-# dataset: torch/cifar10
-
-dataset: cifar10-c
-data_root: '/home/yequan_zhao/dataset'
-num_classes: 10
-severity: 5
-train_n: 1000
-corruption_type: gaussian_noise
-# corruption_type: [gaussian_noise, shot_noise, impulse_noise, speckle_noise, gaussian_blur, defocus_blur, glass_blur, motion_blur, zoom_blur, snow, frost, fog, brightness, contrast, elastic_transform, pixelate, jpeg_compression, saturate, spatter]
-new_head: false
-
+#data_dir: ./torch/cifar10/
+data_dir: /media/data/spike-transformer-network/torch/cifar10/
+dataset: torch/cifar10
 num_classes: 10
 img_size: 32
-
 mean:
     - 0.4914
     - 0.4822
@@ -53,57 +27,25 @@ color_jitter: 0.
 interpolation: bicubic
 train_interpolation: bicubic
 aa: rand-m9-n1-mstd0.4-inc1
-
 mixup: 0.5
 mixup_off_epoch: 200
 mixup_prob: 1.0
 mixup_mode: batch
 mixup_switch_prob: 0.5
 cutmix: 0.0
-
 reprob: 0.25
 remode: const
 amp: True
-
+batch_size: 64
+val_batch_size: 64
+lr: 1e-3
+min_lr: 1e-5
+sched: cosine
+weight_decay: 6e-2
+cooldown_epochs: 10
+warmup_epochs: 20
+warmup_lr: 0.00001
+opt: adamw
+smoothing: 0.1
 workers: 8
 depths: 4
-
-ZO_Estim:
-  en: false
-  # en: true
-  name: ZO_Estim_MC
-  sigma: 0.01
-  n_sample: 100
-  signsgd: false
-
-  # scale: null
-  scale: sqrt_dim
-  # scale: dim
-
-  ZO_trainable_layers_list: null
-
-  actv_perturb_block_idx_list: null
-  param_perturb_block_idx_list: all
-
-  # actv_perturb_block_idx_list: all
-  # param_perturb_block_idx_list: null
-  
-  obj_fn_type: classifier
-  # obj_fn_type: classifier_layerwise
-
-  estimate_method: forward
-  # estimate_method: antithetic
-
-  sample_method: gaussian
-  # sample_method: bernoulli
-  # sample_method: coord_basis
-
-  # en_layerwise_perturbation: true
-  en_layerwise_perturbation: false
-
-  # en_partial_forward: true
-  en_partial_forward: false
-
-  quantized: false
-  normalize_perturbation: false
-  en_param_commit: false

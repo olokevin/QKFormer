@@ -1,0 +1,127 @@
+initial_checkpoint: ./checkpoint/model_best.pth.tar
+# initial_checkpoint: null
+
+epochs: 50
+batch_size: 50
+val_batch_size: 50
+lr: 1e-4
+min_lr: 1e-6
+sched: cosine
+weight_decay: 0
+cooldown_epochs: 0
+warmup_epochs: 5
+warmup_lr: 0.00001
+opt: adamw
+smoothing: 0
+
+time_step: 4
+layer: 4
+dim: 384
+num_heads: 8
+patch_size: 4
+mlp_ratio: 4
+data_dir: /home/yequan_zhao/dataset/
+
+# dataset: torch/cifar10
+
+dataset: cifar10-c
+data_root: '/home/yequan_zhao/dataset'
+num_classes: 10
+severity: 5
+train_n: 1000
+corruption_type: gaussian_noise
+# corruption_type: [gaussian_noise, shot_noise, impulse_noise, speckle_noise, gaussian_blur, defocus_blur, glass_blur, motion_blur, zoom_blur, snow, frost, fog, brightness, contrast, elastic_transform, pixelate, jpeg_compression, saturate, spatter]
+new_head: false
+
+num_classes: 10
+img_size: 32
+
+mean:
+    - 0.4914
+    - 0.4822
+    - 0.4465
+std:
+    - 0.2470
+    - 0.2435
+    - 0.2616
+crop_pct: 1.0
+scale:
+    - 1.0
+    - 1.0
+ratio: [1.0,1.0]
+color_jitter: 0.
+interpolation: bicubic
+train_interpolation: bicubic
+aa: rand-m9-n1-mstd0.4-inc1
+
+mixup: 0.5
+mixup_off_epoch: 200
+mixup_prob: 1.0
+mixup_mode: batch
+mixup_switch_prob: 0.5
+cutmix: 0.0
+
+reprob: 0.25
+remode: const
+amp: True
+
+workers: 8
+depths: 4
+
+trainable_block_list: [
+    'patch_embed1.proj_conv',
+    # 'patch_embed1', 
+    # 'stage1', 
+    # 'patch_embed2',
+    # 'stage2',
+    # 'patch_embed3',
+    # 'stage3',
+    # 'head'
+]
+
+##### BN
+freeze_bn: false
+# freeze_bn: true
+
+# no_train_bn: false
+no_train_bn: true
+
+ZO_Estim:
+  # en: false
+  en: true
+  name: ZO_Estim_MC
+  sigma: 0.01
+  n_sample: 10
+  signsgd: false
+
+  scale: null
+  # scale: sqrt_dim
+  # scale: dim
+
+  ZO_trainable_layers_list: null
+
+  actv_perturb_block_idx_list: null
+  param_perturb_block_idx_list: all
+
+  # actv_perturb_block_idx_list: all
+  # param_perturb_block_idx_list: null
+  
+  obj_fn_type: classifier
+  # obj_fn_type: classifier_layerwise
+
+  estimate_method: forward
+  # estimate_method: antithetic
+
+  sample_method: gaussian
+  # sample_method: bernoulli
+  # sample_method: coord_basis
+
+  # en_layerwise_perturbation: true
+  en_layerwise_perturbation: false
+
+  # en_partial_forward: true
+  en_partial_forward: false
+
+  quantized: false
+  normalize_perturbation: false
+  en_param_commit: false

@@ -3,6 +3,7 @@ __pycache__/
 *$py.class
 
 output/
+checkpoint/
 
 output_dir_qkformer/
 output_dir_qkformer_78.85/

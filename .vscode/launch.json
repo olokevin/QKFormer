@@ -5,16 +5,17 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "imagenet-c",
+      "name": "ZO",
       "type": "debugpy",
       "request": "launch",
       "program": "train.py",
       "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}/imagenet",
-      // "cwd": "${workspaceFolder}/cifar10",
+      // "cwd": "${workspaceFolder}/imagenet",
+      "cwd": "${workspaceFolder}/cifar10",
       // "cwd": "${workspaceFolder}/cifar100",
       "args": [
-        "-c", "ZO.yml"
+        "-c", "ZO.yml",
+        "--debug"
       ]
     },
   ]

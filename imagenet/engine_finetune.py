@@ -22,9 +22,6 @@ import torch.nn.functional as F
 from ZO_Estim.ZO_Estim_entry import build_obj_fn
 from ZO_Estim.ZO_utils import default_create_bwd_pre_hook_ZO_grad
 
-DEBUG = False
-# DEBUG = True
-
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
@@ -74,7 +71,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 # bwd_pre_hook_list = []
                 # for splited_layer in ZO_Estim.splited_layer_list:
                 #     create_bwd_pre_hook_ZO_grad = getattr(splited_layer.layer, 'create_bwd_pre_hook_ZO_grad', default_create_bwd_pre_hook_ZO_grad)
-                #     bwd_pre_hook_list.append(splited_layer.layer.register_full_backward_pre_hook(create_bwd_pre_hook_ZO_grad(splited_layer.layer.ZO_grad_output, DEBUG)))
+                #     bwd_pre_hook_list.append(splited_layer.layer.register_full_backward_pre_hook(create_bwd_pre_hook_ZO_grad(splited_layer.layer.ZO_grad_output, args.debug)))
                 # output = model(data)
                 # loss = criterion(output, target)
                 # loss.backward()
@@ -85,7 +82,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 fwd_hook_list = []
                 for splited_layer in ZO_Estim.splited_layer_list:
 
-                    fwd_hook_get_param_grad = splited_layer.layer.create_fwd_hook_get_param_grad(splited_layer.layer.ZO_grad_output, DEBUG)
+                    fwd_hook_get_param_grad = splited_layer.layer.create_fwd_hook_get_param_grad(splited_layer.layer.ZO_grad_output, args.debug)
                     fwd_hook_list.append(splited_layer.layer.register_forward_hook(fwd_hook_get_param_grad))
                     
                     with torch.no_grad():
@@ -96,7 +93,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     fwd_hook_handle.remove()
             
             ### save param FO grad
-            if DEBUG:
+            if args.debug:
                 for param in model.parameters():
                     if param.requires_grad:
                         param.ZO_grad = param.grad.clone()
