@@ -62,9 +62,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if ZO_Estim is not None:
             obj_fn = build_obj_fn(ZO_Estim.obj_fn_type, data=samples, target=targets, model=model, criterion=criterion)
             ZO_Estim.update_obj_fn(obj_fn)
-            with torch.no_grad():
-                pred, loss = obj_fn()
-                ZO_Estim.estimate_grad(old_loss=loss)
+            # with torch.no_grad():
+            #     pred, loss = obj_fn()
+            #     ZO_Estim.estimate_grad(old_loss=loss)
+            
+            outputs, loss = ZO_Estim.estimate_grad()
                 
             ### pseudo NP
             if ZO_Estim.splited_layer_list is not None:

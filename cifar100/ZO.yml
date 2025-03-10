@@ -1,81 +1,77 @@
-batch_size: 20
-epochs: 50
-accum_iter: 1
+initial_checkpoint: ./checkpoint/model_best.pth.tar
+# initial_checkpoint: null
 
-data_path: '/home/yequan_zhao/dataset/ImageNet2012'
-
-dataset: imagenet-c
-data_root: '/home/yequan_zhao/dataset'
-severity: 3
-train_n: 5000
-corruption_type: gaussian_noise
-# corruption_type: [gaussian_noise, shot_noise, impulse_noise, speckle_noise, defocus_blur, glass_blur, motion_blur, zoom_blur, snow, frost, fog, brightness, contrast, elastic_transform, pixelate, jpeg_compression]
-new_head: false
-
-# model: 'QKFormer_10_384'
-# finetune: './output_dir_qkformer_78.85/checkpoint-199.pth'
-
-model: 'QKFormer_10_512'
-finetune: './output_dir_qkformer_82.08/checkpoint-196.pth'
-
-# model: 'QKFormer_10_768'
-# finetune: './output_dir_qkformer_84.29/checkpoint-191.pth'
+epochs: 20
+batch_size: 50
+val_batch_size: 50
+lr: 1e-4
+min_lr: 1e-6
+sched: cosine
+weight_decay: 0
+cooldown_epochs: 0
+warmup_epochs: 0
+warmup_lr: 0.00001
+opt: adamw
+smoothing: 0
 
 time_step: 4
-input_size: 224
-drop_path: 0
+layer: 4
+dim: 384
+num_heads: 8
+patch_size: 4
+mlp_ratio: 4
+data_dir: /home/yequan_zhao/dataset/
 
-##### Optimizer
-clip_grad: null
-weight_decay: 0.05
-lr: null
-blr: 1e-1
-layer_decay: 1.0
-min_lr: 1e-6
-warmup_epochs: 0
+# dataset: torch/cifar10
 
-color_jitter: null
-aa: 'rand-m9-mstd0.5-inc1'
-smoothing: 0.1
+dataset: cifar100-c
+data_root: '/home/yequan_zhao/dataset'
+num_classes: 100
+severity: 5
+train_n: 1000
+corruption_type: gaussian_noise
+# corruption_type: [gaussian_noise, shot_noise, impulse_noise, speckle_noise, gaussian_blur, defocus_blur, glass_blur, motion_blur, zoom_blur, snow, frost, fog, brightness, contrast, elastic_transform, pixelate, jpeg_compression, saturate, spatter]
+new_head: false
+
+# num_classes: 100
+img_size: 32
+
+mean:
+    - 0.4914
+    - 0.4822
+    - 0.4465
+std:
+    - 0.2470
+    - 0.2435
+    - 0.2616
+crop_pct: 1.0
+scale:
+    - 1.0
+    - 1.0
+ratio: [1.0,1.0]
+color_jitter: 0.
+interpolation: bicubic
+train_interpolation: bicubic
+aa: rand-m9-n1-mstd0.4-inc1
+
+mixup: 0.5
+mixup_off_epoch: 200
+mixup_prob: 1.0
+mixup_mode: batch
+mixup_switch_prob: 0.5
+cutmix: 0.0
 
 reprob: 0.25
-remode: 'pixel'
-recount: 1
-resplit: false
+remode: const
+amp: True
 
-mixup: 0
-cutmix: 0
-cutmix_minmax: null
-mixup_prob: 1.0
-mixup_switch_prob: 0.5
-mixup_mode: 'batch'
-
-global_pool: true
-cls_token: false
-
-nb_classes: 1000
-output_dir: './output_dir_qkformer'
-log_dir: './output_dir_qkformer'
-device: 'cuda'
-seed: 0
-resume: ''
-
-start_epoch: 0
-eval: false
-dist_eval: false
-num_workers: 10
-pin_mem: true
-no_pin_mem: false
-
-world_size: 1
-local_rank: -1
-dist_on_itp: false
-dist_url: 'env://'
+workers: 8
+depths: 4
 
 trainable_block_list: [
-    # 'patch_embed1.proj_conv',
+    'patch_embed1.proj_conv',
     # 'patch_embed1', 
-    'stage1', 
+    # 'stage1', 
     # 'patch_embed2',
     # 'stage2',
     # 'patch_embed3',
@@ -91,8 +87,8 @@ freeze_bn: false
 no_train_bn: true
 
 ZO_Estim:
-  en: false
-  # en: true
+  # en: false
+  en: true
   name: ZO_Estim_MC
   sigma: 0.01
   n_sample: 1

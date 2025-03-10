@@ -71,6 +71,8 @@ class ZO_Estim_MC(nn.Module):
         self.en_layerwise_perturbation = config.en_layerwise_perturbation
         self.en_partial_forward = config.en_partial_forward
         self.en_param_commit = config.en_param_commit
+        
+        self.config = config
 
         self.device = next(model.parameters()).device
         
@@ -375,21 +377,21 @@ class ZO_Estim_MC(nn.Module):
         
         return None
     
-    def get_param_ZO_gradient(self, old_loss):
-        if self.en_layerwise_perturbation:
+    # def get_param_ZO_gradient(self, old_loss):
+    #     if self.en_layerwise_perturbation:
             
-            for splited_param in self.splited_param_list:
-                if self.en_partial_forward:
-                    block_in = self.obj_fn(ending_idx=splited_param.idx, return_loss_reduction='no_loss')
-                else:
-                    block_in = None
-                ### TODO: could further specify sigma, estimate_method, sample_method for different params
-                param_ZO_grad = self.get_single_param_ZO_gradient(splited_param, block_in, old_loss, self.sigma, self.estimate_method, self.sample_method)
+    #         for splited_param in self.splited_param_list:
+    #             if self.en_partial_forward:
+    #                 block_in = self.obj_fn(ending_idx=splited_param.idx, return_loss_reduction='no_loss')
+    #             else:
+    #                 block_in = None
+    #             ### TODO: could further specify sigma, estimate_method, sample_method for different params
+    #             param_ZO_grad = self.get_single_param_ZO_gradient(splited_param, block_in, old_loss, self.sigma, self.estimate_method, self.sample_method)
                     
-                splited_param.param.grad = param_ZO_grad
+    #             splited_param.param.grad = param_ZO_grad
 
-        else:
-            self.get_all_param_ZO_gradient(old_loss, self.sigma, self.estimate_method, self.sample_method)
+    #     else:
+    #         self.get_all_param_ZO_gradient(old_loss, self.sigma, self.estimate_method, self.sample_method)
 
     ### memory-efficient implementation
     
@@ -559,7 +561,8 @@ class ZO_Estim_MC(nn.Module):
             if batch_sz == 1:
                 ZO_grad += loss_diff / self.sigma * u
             else:
-                if 'ATIS' in self.obj_fn_type or 'MNLI' in self.obj_fn_type:
+                # if 'ATIS' in self.obj_fn_type or 'MNLI' in self.obj_fn_type:
+                if any([x in self.obj_fn_type for x in ['ATIS', 'MNLI', 'LM']]):
                     if len(loss_diff) == u.shape[1]:
                     # if type(splited_layer.layer) in self.model.ZO_trainable_layers_dict.values():
                         ZO_grad += torch.einsum('i,si...->si...', (loss_diff / self.sigma, u)) 
@@ -585,14 +588,392 @@ class ZO_Estim_MC(nn.Module):
             ZO_grad *= (batch_sz*n_sample / (batch_sz*n_sample+actv_dim-1))
 
         ### Apply estimated gradient
-        # if type(splited_layer.layer) in (RealQuantLinear,):
-
         splited_layer.layer.ZO_grad_output = ZO_grad
         # if type(splited_layer.layer) == nn.Linear:
         #     splited_layer.layer.weight.grad = torch.matmul(ZO_grad.T, splited_layer.layer.in_value)
         #     splited_layer.layer.bias.grad = torch.sum(ZO_grad, dim=0)
         # else:
         #     splited_layer.layer.local_backward(ZO_grad, block_in) 
+    
+    def get_all_actv_ZO_gradient(self, block_in, old_loss_vec):
+
+        ### Generate random perturbation with the same shape as the parameter
+        ### Add perturbation to the parameter
+        ### Estimate gradient
+        
+        
+        batch_sz = len(old_loss_vec)
+        actv_dim = self.ZO_dimension
+        if self.sample_method == 'coord_basis':
+            raise NotImplementedError
+            # actv_dim = np.prod(post_actv_shape[1:])
+            # feature_shape = post_actv_shape[1:]
+            # n_sample = actv_dim
+        else:
+            n_sample = self.n_sample 
+        
+        ### scaling factor
+        if self.sample_method == 'coord_basis':
+            scaling_factor = (1 / batch_sz)
+        else:
+            scaling_factor = (1 / self.n_sample / batch_sz)
+
+        ### No scaling
+        if self.scale is None:
+            pass
+        elif self.scale == 'sqrt_dim':
+            scaling_factor *= math.sqrt(batch_sz*n_sample / (batch_sz*n_sample+actv_dim-1))
+        elif self.scale == 'dim':
+            scaling_factor *= (batch_sz*n_sample / (batch_sz*n_sample+actv_dim-1))     
+        
+        ### Perturbed forwards
+        for i in range(n_sample):
+            fwd_hook_handle_list = []
+            ### Add perturbation to all activations
+            for splited_layer in self.splited_layer_list:
+                splited_layer.ZO_random_seed = torch.randint(0, 100000, (1,))
+                create_fwd_hook_add_perturbation = getattr(splited_layer.layer, 'create_fwd_hook_add_perturbation', default_create_fwd_hook_add_perturbation)
+                # fwd_hook_add_perturbation = create_fwd_hook_add_perturbation(u*self.sigma)
+                fwd_hook_add_perturbation = create_fwd_hook_add_perturbation(splited_layer.ZO_random_seed, self.sigma, self.rand_gen_fn)
+                fwd_hook_handle = splited_layer.layer.register_forward_hook(fwd_hook_add_perturbation)
+                fwd_hook_handle_list.append(fwd_hook_handle)
+
+            if self.en_partial_forward:
+                _, pos_loss = self.obj_fn(starting_idx=splited_layer.idx, input=block_in, return_loss_reduction='none')
+            else:
+                _, pos_loss = self.obj_fn(return_loss_reduction='none')
+            
+            for fwd_hook_handle in fwd_hook_handle_list:    
+                fwd_hook_handle.remove()
+                
+            self.forward_counter += 1
+
+            if self.estimate_method == 'forward':
+                loss_diff = pos_loss - old_loss_vec
+
+            elif self.estimate_method == 'antithetic':
+                fwd_hook_handle_list = []
+                ### Add perturbation to the parameter
+                for splited_layer in self.splited_layer_list:
+                    # splited_layer.layer.en_perturb_forward( - u * self.sigma)
+                    create_fwd_hook_add_perturbation = getattr(splited_layer.layer, 'create_fwd_hook_add_perturbation', default_create_fwd_hook_add_perturbation)
+                    # fwd_hook_add_perturbation = create_fwd_hook_add_perturbation(- u * self.sigma)
+                    fwd_hook_add_perturbation = create_fwd_hook_add_perturbation(splited_layer.ZO_random_seed, -self.sigma, self.rand_gen_fn)
+                    fwd_hook_handle = splited_layer.layer.register_forward_hook(fwd_hook_add_perturbation)
+                    fwd_hook_handle_list.append(fwd_hook_handle)
+
+                if self.en_partial_forward:
+                    _, neg_loss = self.obj_fn(starting_idx=splited_layer.idx, input=block_in, return_loss_reduction='none')
+                else:
+                    _, neg_loss = self.obj_fn(return_loss_reduction='none')
+
+                for fwd_hook_handle in fwd_hook_handle_list:    
+                    fwd_hook_handle.remove()
+                
+                self.forward_counter += 1
+                
+                loss_diff = (pos_loss - neg_loss) / 2.0
+                    
+            ### estimate gradient
+            for splited_layer in self.splited_layer_list:
+                u = splited_layer.layer.perturbation
+
+                ### init
+                if i == 0:
+                    splited_layer.layer.ZO_grad_output = torch.zeros(u.shape, device=self.device)
+                    
+                
+                if batch_sz == 1:
+                    splited_layer.layer.ZO_grad_output += scaling_factor * loss_diff / self.sigma * u
+                else:
+                    # if 'ATIS' in self.obj_fn_type or 'MNLI' in self.obj_fn_type:
+                    if any([x in self.obj_fn_type for x in ['ATIS', 'MNLI', 'LM']]):
+                        if len(loss_diff) == u.shape[1]:
+                        # if type(splited_layer.layer) in self.model.ZO_trainable_layers_dict.values():
+                            splited_layer.layer.ZO_grad_output += torch.einsum('i,si...->si...', (scaling_factor * loss_diff / self.sigma, u)) 
+                        else:
+                            splited_layer.layer.ZO_grad_output += torch.einsum('i,i...->i...', (scaling_factor * loss_diff / self.sigma, u))
+                    else:
+                        splited_layer.layer.ZO_grad_output += torch.einsum('i,i...->i...', (scaling_factor * loss_diff / self.sigma, u))
+        
+        if self.signsgd is True:
+            for splited_layer in self.splited_layer_list:
+                splited_layer.layer.ZO_grad_output = torch.sign(splited_layer.layer.ZO_grad_output)
+
+        ### Apply estimated gradient
+        # splited_layer.layer.ZO_grad_output = ZO_grad
+        # if type(splited_layer.layer) == nn.Linear:
+        #     splited_layer.layer.weight.grad = torch.matmul(ZO_grad.T, splited_layer.layer.in_value)
+        #     splited_layer.layer.bias.grad = torch.sum(ZO_grad, dim=0)
+        # else:
+        #     splited_layer.layer.local_backward(ZO_grad, block_in) 
+    
+    def get_pseudo_param_ZO_gradient(self):
+
+        ### Generate random perturbation with the same shape as the parameter
+        ### Add perturbation to the parameter
+        ### Estimate gradient
+        
+        if self.estimate_method == 'forward':
+            output, output_grad, outputs, loss = self.obj_fn(return_loss_reduction='pzo')
+            self.model.zero_grad()
+            self.forward_counter += 1
+        else:
+            pass
+        
+        if self.sample_method == 'coord_basis':
+            raise NotImplementedError
+      
+        n_sample = self.n_sample
+        
+        param_dim = 0
+        for splited_param in self.splited_param_list:
+            splited_param.old_param = splited_param.param.detach()
+            param_dim += splited_param.param.numel()
+        
+        ### Perturbed forwards
+        for i in range(n_sample):
+            ### Generate random perturbation with the same shape as the parameter
+            for splited_param in self.splited_param_list:
+                splited_param.u = self._generate_random_vector(splited_param.param.shape, self.sample_method, self.device)
+            
+            if self.normalize_perturbation:
+                p_sigma = self.sigma / torch.linalg.vector_norm(torch.cat([splited_param.u.view(-1) for splited_param in self.splited_param_list]))
+            else:
+                p_sigma = self.sigma
+                    
+            # pos
+            with torch.no_grad():
+                for splited_param in self.splited_param_list:
+                    splited_param.param.add_(splited_param.u * p_sigma)
+
+            if self.estimate_method == 'forward':
+                with torch.no_grad():
+                    pos_output = self.obj_fn(return_loss_reduction='pzo_nograd')
+            else:
+                pos_output, pos_output_grad, pos_outputs, pos_loss = self.obj_fn(return_loss_reduction='pzo_nograd')
+                
+            self.model.zero_grad()
+                
+            self.forward_counter += 1
+
+            if self.estimate_method == 'antithetic':
+                with torch.no_grad():
+                    for splited_param in self.splited_param_list:
+                        splited_param.param.copy_(splited_param.old_param)
+                        splited_param.param.sub_(splited_param.u * p_sigma)
+
+                neg_output, neg_output_grad, neg_outputs, neg_loss = self.obj_fn(return_loss_reduction='pzo')
+                self.model.zero_grad()
+                
+                self.forward_counter += 1
+                
+            with torch.no_grad():
+                for splited_param in self.splited_param_list:
+                    splited_param.param.copy_(splited_param.old_param)
+                
+            if self.estimate_method == 'one_point':
+                tilde_o = pos_output
+                output_grad = pos_output_grad
+                outputs = pos_outputs
+                loss = pos_loss
+            elif self.estimate_method == 'forward':
+                tilde_o = pos_output - output
+            elif self.estimate_method == 'antithetic':
+                tilde_o = (pos_output - neg_output) / 2.0
+            
+            ### scaling factor
+            scaling_factor = (1 / n_sample)
+
+            ### No scaling
+            if self.scale is None:
+                pass
+            elif self.scale == 'sqrt_dim':
+                scaling_factor *= math.sqrt(n_sample / (n_sample+param_dim-1))
+            elif self.scale == 'dim':
+                scaling_factor *= n_sample / (n_sample+param_dim-1)
+                    
+            ### estimate gradient
+        #     for splited_param in self.splited_param_list:
+        #         param_shape = splited_param.param.shape
+        #         u = splited_param.u.view(-1)
+                
+        #         with torch.cuda.amp.autocast():
+        #             feedback_matrix = torch.einsum('d,bm->dbm', (u, tilde_o))
+                
+        #         if float(self.config.pzo_momentum) > 0: 
+        #             if hasattr(splited_param, 'feedback_matrix') is False:
+        #                 splited_param.feedback_matrix = feedback_matrix
+        #             else:
+        #                 splited_param.feedback_matrix = self.config.pzo_momentum * splited_param.feedback_matrix + (1 - self.config.pzo_momentum) * feedback_matrix
+        #                 feedback_matrix = splited_param.feedback_matrix
+        #         else:
+        #             splited_param.feedback_matrix = feedback_matrix
+                    
+        #         ### init
+        #         if i == 0:
+        #             splited_param.param_grad = torch.zeros(param_shape, device=self.device)
+
+        #         with torch.cuda.amp.autocast():
+        #             splited_param.param_grad += scaling_factor * torch.einsum('dbm,bm->d', (splited_param.feedback_matrix, output_grad)).reshape(param_shape)
+        
+        # for splited_param in self.splited_param_list:    
+        #     splited_param.param.grad = splited_param.param_grad
+                
+            ### estimate gradient
+            batch_sz = tilde_o.shape[0]
+            m_dim = tilde_o.shape[1]
+            for splited_param in self.splited_param_list:
+                param_shape = splited_param.param.shape
+                u = splited_param.u.view(-1)
+                
+                d_dim = u.shape[0]
+               
+                new_feedback_matrix = torch.zeros((batch_sz, d_dim, m_dim), device=self.device)
+                
+                with torch.cuda.amp.autocast():
+                    # new_feedback_matrix = torch.einsum('d,bm->bmd', (u, tilde_o))
+                    for i_bz in range(batch_sz):
+                        new_feedback_matrix[i_bz] = torch.einsum('d,m->dm', (u, tilde_o[i_bz]))
+                
+                if i == 0:
+                    splited_param.new_feedback_matrix = torch.zeros((batch_sz, d_dim, m_dim), device=self.device)
+                  
+                splited_param.new_feedback_matrix +=  new_feedback_matrix
+
+                
+        
+        for splited_param in self.splited_param_list:
+            # momentum feedback connections
+            if float(self.config.pzo_momentum) > 0: 
+                if hasattr(splited_param, 'feedback_matrix') is False:
+                    splited_param.feedback_matrix = splited_param.new_feedback_matrix
+                else:
+                    splited_param.feedback_matrix = self.config.pzo_momentum * splited_param.feedback_matrix + (1 - self.config.pzo_momentum) * splited_param.new_feedback_matrix
+            else:
+                splited_param.feedback_matrix = splited_param.new_feedback_matrix
+            # compute gradient
+            with torch.cuda.amp.autocast():
+                # splited_param.param_grad += scaling_factor * torch.einsum('bmd,bm->d', (splited_param.feedback_matrix, output_grad)).reshape(param_shape)
+                param_grad = torch.zeros((batch_sz, d_dim), device=self.device)
+                for i_bz in range(batch_sz):
+                    param_grad[i_bz] = torch.einsum('dm,m->d', (splited_param.feedback_matrix[i_bz], output_grad[i_bz]))
+                param_grad = scaling_factor * param_grad.sum(dim=0)
+                
+            splited_param.param.grad = param_grad.reshape(splited_param.param.shape)
+        
+            
+        
+        return outputs, loss
+    
+    def get_pseudo_actv_ZO_gradient(self):
+
+        ### Generate random perturbation with the same shape as the parameter
+        ### Add perturbation to the parameter
+        ### Estimate gradient
+        
+        if self.estimate_method == 'forward':
+            output, output_grad, outputs, loss = self.obj_fn(return_loss_reduction='pzo')
+            self.model.zero_grad()
+            self.forward_counter += 1
+        else:
+            pass
+        
+        if self.sample_method == 'coord_basis':
+            raise NotImplementedError
+      
+        actv_dim = self.ZO_dimension
+        n_sample = self.n_sample
+        
+        ### Perturbed forwards
+        for i in range(n_sample):
+            fwd_hook_handle_list = []
+            ### Add perturbation to all activations
+            for splited_layer in self.splited_layer_list:
+                splited_layer.ZO_random_seed = torch.randint(0, 100000, (1,))
+                create_fwd_hook_add_perturbation = getattr(splited_layer.layer, 'create_fwd_hook_add_perturbation', default_create_fwd_hook_add_perturbation)
+                # fwd_hook_add_perturbation = create_fwd_hook_add_perturbation(u*self.sigma)
+                fwd_hook_add_perturbation = create_fwd_hook_add_perturbation(splited_layer.ZO_random_seed, self.sigma, self.rand_gen_fn)
+                fwd_hook_handle = splited_layer.layer.register_forward_hook(fwd_hook_add_perturbation)
+                fwd_hook_handle_list.append(fwd_hook_handle)
+
+            pos_output, pos_output_grad, pos_outputs, pos_loss = self.obj_fn(return_loss_reduction='pzo')
+            self.model.zero_grad()
+            
+            for fwd_hook_handle in fwd_hook_handle_list:    
+                fwd_hook_handle.remove()
+                
+            self.forward_counter += 1
+
+            if self.estimate_method == 'antithetic':
+                fwd_hook_handle_list = []
+                ### Add perturbation to the parameter
+                for splited_layer in self.splited_layer_list:
+                    # splited_layer.layer.en_perturb_forward( - u * self.sigma)
+                    create_fwd_hook_add_perturbation = getattr(splited_layer.layer, 'create_fwd_hook_add_perturbation', default_create_fwd_hook_add_perturbation)
+                    # fwd_hook_add_perturbation = create_fwd_hook_add_perturbation(- u * self.sigma)
+                    fwd_hook_add_perturbation = create_fwd_hook_add_perturbation(splited_layer.ZO_random_seed, -self.sigma, self.rand_gen_fn)
+                    fwd_hook_handle = splited_layer.layer.register_forward_hook(fwd_hook_add_perturbation)
+                    fwd_hook_handle_list.append(fwd_hook_handle)
+
+                neg_output, neg_output_grad, neg_outputs, neg_loss = self.obj_fn(return_loss_reduction='pzo')
+                self.model.zero_grad()
+
+                for fwd_hook_handle in fwd_hook_handle_list:    
+                    fwd_hook_handle.remove()
+                
+                self.forward_counter += 1
+                
+            if self.estimate_method == 'one_point':
+                tilde_o = pos_output
+                output_grad = pos_output_grad
+                outputs = pos_outputs
+                loss = pos_loss
+            elif self.estimate_method == 'forward':
+                tilde_o = pos_output - output
+            elif self.estimate_method == 'antithetic':
+                tilde_o = (pos_output - neg_output) / 2.0
+            
+            batch_sz = tilde_o.shape[1]
+            
+            ### scaling factor
+            scaling_factor = (1 / n_sample / batch_sz)
+
+            ### No scaling
+            if self.scale is None:
+                pass
+            elif self.scale == 'sqrt_dim':
+                scaling_factor *= math.sqrt(batch_sz*n_sample / (batch_sz*n_sample+actv_dim-1))
+            elif self.scale == 'dim':
+                scaling_factor *= (batch_sz*n_sample / (batch_sz*n_sample+actv_dim-1))    
+                    
+            ### estimate gradient
+            for splited_layer in self.splited_layer_list:
+                u = splited_layer.layer.perturbation
+                
+                feedback_matrix = torch.einsum('...d,...m->dm', (u, tilde_o))
+                if float(self.config.pzo_momentum) > 0: 
+                    if hasattr(splited_layer.layer, 'feedback_matrix') is False:
+                        splited_layer.layer.feedback_matrix = feedback_matrix
+                    else:
+                        splited_layer.layer.feedback_matrix = self.config.pzo_momentum * splited_layer.layer.feedback_matrix + (1 - self.config.pzo_momentum) * feedback_matrix
+                        feedback_matrix = splited_layer.layer.feedback_matrix
+
+                ### init
+                if i == 0:
+                    splited_layer.layer.ZO_grad_output = torch.zeros(u.shape, device=self.device)
+
+                splited_layer.layer.ZO_grad_output += scaling_factor * torch.einsum('dm,...m->...d', (feedback_matrix, output_grad))
+
+        ### Apply estimated gradient
+        # splited_layer.layer.ZO_grad_output = ZO_grad
+        # if type(splited_layer.layer) == nn.Linear:
+        #     splited_layer.layer.weight.grad = torch.matmul(ZO_grad.T, splited_layer.layer.in_value)
+        #     splited_layer.layer.bias.grad = torch.sum(ZO_grad, dim=0)
+        # else:
+        #     splited_layer.layer.local_backward(ZO_grad, block_in) 
+        
+        return outputs, loss
 
     def update_obj_fn(self, obj_fn):
         self.obj_fn = obj_fn
@@ -623,7 +1004,9 @@ class ZO_Estim_MC(nn.Module):
             
             for splited_layer in self.splited_layer_list:
                 if splited_layer.mode == 'actv':
-                    print(f'{splited_layer.name} out_dimension={splited_layer.layer.out_dimension}')
+                    # print(f'{splited_layer.name} out_dimension={splited_layer.layer.out_dimension}')
+                    print(f'{splited_layer.name} out_shape={splited_layer.layer.output_shape} out_dimension={splited_layer.layer.out_dimension}')
+                    ZO_dimension += splited_layer.layer.out_dimension
 
                 elif splited_layer.mode == 'param':
                     param_dim = 0
@@ -632,7 +1015,7 @@ class ZO_Estim_MC(nn.Module):
                             param_dim += param.numel()
                     print(f'{splited_layer.name} param_dimension={param_dim}')
                 
-                ZO_dimension += splited_layer.layer.out_dimension
+                    ZO_dimension += param_dim
                     
             for fwd_hook_handle in fwd_hook_handle_list:
                 fwd_hook_handle.remove()  
@@ -641,27 +1024,60 @@ class ZO_Estim_MC(nn.Module):
         print('ZO_dimension=', ZO_dimension)
         return ZO_dimension
     
-    def estimate_grad(self, old_loss):
-        
-        # self.model.zero_grad()
-        if self.splited_layer_list is not None:
-            if self.estimate_method == 'forward':
-                _, old_loss_vec = self.obj_fn(return_loss_reduction='none')
-            else:
-                old_loss_vec = None
-            
-            for splited_layer in self.splited_layer_list:
-                if self.en_partial_forward:
-                    block_in = self.obj_fn(ending_idx=splited_layer.idx, return_loss_reduction='no_loss')
-                else:
-                    block_in = None
+    def estimate_grad(self):
+        ### modelwise pseudo-ZO node perturbation
+        if getattr(self.config, 'en_pseudo_ZO', False):
+            if self.splited_layer_list is not None:
+                outputs, loss = self.get_pseudo_actv_ZO_gradient()
+            if self.splited_param_list is not None:
+                outputs, loss = self.get_pseudo_param_ZO_gradient()
+        else:
+            with torch.no_grad():
+                if self.splited_layer_list is not None:
+                
+                    outputs, old_loss_vec = self.obj_fn(return_loss_reduction='none')
+                    loss = old_loss_vec.mean()
                     
-                if splited_layer.mode == 'actv':
-                    self.get_actv_ZO_gradient(splited_layer, block_in, old_loss_vec)
-                elif splited_layer.mode == 'param':
-                    self.get_layer_param_ZO_gradient(splited_layer, block_in, old_loss)
+                    ### layerwise node/weight perturbation
+                    if self.en_layerwise_perturbation:
+                        for splited_layer in self.splited_layer_list:
+                            if self.en_partial_forward:
+                                block_in = self.obj_fn(ending_idx=splited_layer.idx, return_loss_reduction='no_loss')
+                            else:
+                                block_in = None
+                                
+                            if splited_layer.mode == 'actv':
+                                self.get_actv_ZO_gradient(splited_layer, block_in, old_loss_vec)
+                            elif splited_layer.mode == 'param':
+                                self.get_layer_param_ZO_gradient(splited_layer, block_in, loss)
+                    ### modelwise node perturbation
+                    else:
+                        
+                        if self.en_partial_forward:
+                            block_in = self.obj_fn(ending_idx=self.splited_layer_list[0].idx, return_loss_reduction='no_loss')
+                        else:
+                            block_in = None
+                            
+                        self.get_all_actv_ZO_gradient(block_in, old_loss_vec)
+            
+                if self.splited_param_list is not None:
+                    outputs, loss = self.obj_fn()
+                    
+                    ### layerwise weight perturbation
+                    if self.en_layerwise_perturbation:
+                    
+                        for splited_param in self.splited_param_list:
+                            if self.en_partial_forward:
+                                block_in = self.obj_fn(ending_idx=splited_param.idx, return_loss_reduction='no_loss')
+                            else:
+                                block_in = None
+                            ### TODO: could further specify sigma, estimate_method, sample_method for different params
+                            param_ZO_grad = self.get_single_param_ZO_gradient(splited_param, block_in, loss, self.sigma, self.estimate_method, self.sample_method)
+                                
+                            splited_param.param.grad = param_ZO_grad
+
+                    ### modelwise weight perturbation
+                    else:
+                        self.get_all_param_ZO_gradient(loss, self.sigma, self.estimate_method, self.sample_method)
         
-        if self.splited_param_list is not None:
-            self.get_param_ZO_gradient(old_loss=old_loss)
-        
-        return None
+        return outputs, loss

@@ -20,7 +20,7 @@ import numpy as np
 import torch
 import torchvision
 from torch.utils.data import Subset
-from robustbench.data import load_cifar10c
+from robustbench.data import load_cifar10c, load_cifar100c
 from torch.utils.data import Dataset
 from PIL import Image
 
@@ -173,6 +173,163 @@ def build_cifar10c_dataset(args):
     
     return dataset_train, dataset_val, dataset_test
 
+class CIFAR100CDataset(Dataset):
+    """
+    CIFAR-100-C Dataset that mimics the behavior of the CIFAR100 dataset in torchvision
+    to be fully compatible with timm's data pipeline.
+    """
+    def __init__(self, images, labels, is_training=False, **kwargs):
+        # Store original data
+        if isinstance(images, torch.Tensor):
+            if images.shape[1] == 3:  # If NCHW format
+                images = images.permute(0, 2, 3, 1)  # Convert to NHWC for PIL compatibility
+            self.data = images.cpu().numpy()
+        else:
+            self.data = images
+            
+        if isinstance(labels, torch.Tensor):
+            self.targets = labels.cpu().numpy()
+        else:
+            self.targets = labels
+        
+        # Ensure data is in uint8 format for PIL conversion
+        if self.data.dtype != np.uint8:
+            if self.data.max() <= 1.0:
+                self.data = (self.data * 255).astype(np.uint8)
+            else:
+                self.data = self.data.astype(np.uint8)
+        
+        # Standard CIFAR-100 classes
+        self.classes = [
+            'apple', 'aquarium_fish', 'baby', 'bear', 'beaver', 'bed', 'bee', 'beetle', 'bicycle', 'bottle',
+            'bowl', 'boy', 'bridge', 'bus', 'butterfly', 'camel', 'can', 'castle', 'caterpillar', 'cattle',
+            'chair', 'chimpanzee', 'clock', 'cloud', 'cockroach', 'couch', 'crab', 'crocodile', 'cup', 'dinosaur',
+            'dolphin', 'elephant', 'flatfish', 'forest', 'fox', 'girl', 'hamster', 'house', 'kangaroo', 'keyboard',
+            'lamp', 'lawn_mower', 'leopard', 'lion', 'lizard', 'lobster', 'man', 'maple_tree', 'motorcycle', 'mountain',
+            'mouse', 'mushroom', 'oak_tree', 'orange', 'orchid', 'otter', 'palm_tree', 'pear', 'pickup_truck', 'pine_tree',
+            'plain', 'plate', 'poppy', 'porcupine', 'possum', 'rabbit', 'raccoon', 'ray', 'road', 'rocket',
+            'rose', 'sea', 'seal', 'shark', 'shrew', 'skunk', 'skyscraper', 'snail', 'snake', 'spider',
+            'squirrel', 'streetcar', 'sunflower', 'sweet_pepper', 'table', 'tank', 'telephone', 'television', 'tiger', 'tractor',
+            'train', 'trout', 'tulip', 'turtle', 'wardrobe', 'whale', 'willow_tree', 'wolf', 'woman', 'worm'
+        ]
+        self.class_to_idx = {cls: i for i, cls in enumerate(self.classes)}
+        
+        # Create the dataset_config that timm expects
+        self.dataset_config = {
+            'input_size': (3, 32, 32),
+            'interpolation': 'bilinear',
+            'mean': (0.5071, 0.4867, 0.4408),
+            'std': (0.2675, 0.2565, 0.2761),
+            'crop_pct': 1.0,
+            'num_classes': len(self.classes)
+        }
+        
+        # Store all the attributes timm expects
+        self.transform = None  # Will be set by timm's create_loader
+        self.target_transform = None
+        self.is_training = is_training
+        
+        # Add additional attributes for timm compatibility
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+            
+    def __getitem__(self, index):
+        img, target = self.data[index], self.targets[index]
+        
+        # Convert numpy to PIL Image
+        img = Image.fromarray(img)
+        
+        # Apply transforms if they exist (will be set by timm's create_loader)
+        if self.transform is not None:
+            img = self.transform(img)
+            
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+            
+        return img, target
+    
+    def __len__(self):
+        return len(self.data)
+      
+def build_cifar100c_dataset(args):
+    """
+    Build CIFAR-100-C dataset with the same format as timm's create_dataset.
+    The returned datasets can be directly passed to timm's create_loader.
+    
+    Args:
+        args: Arguments containing dataset parameters
+            - corruption_type: Type of corruption to use
+            - train_n: Number of training examples
+            - severity: Corruption severity level (1-5)
+            - data_root: Directory containing CIFAR-100-C files
+    
+    Returns:
+        train, validation, and test datasets compatible with timm's create_loader
+    """
+    corruption_type = args.corruption_type
+    train_n = args.train_n
+    severity = args.severity
+    
+    # Use the RobustBench's load_cifar100c function
+    x_corr, y_corr = load_cifar100c(
+        10000, severity, os.path.expanduser(args.data_root), False, [corruption_type]
+    )
+
+    # Split data into train, validation, and test sets
+    labels = {}
+    num_classes = int(max(y_corr)) + 1
+    for i in range(num_classes):
+        labels[i] = [ind for ind, n in enumerate(y_corr) if n == i]
+    
+    num_ex = train_n // num_classes
+    tr_idxs = []
+    val_idxs = []
+    test_idxs = []
+    
+    for i in range(len(labels.keys())):
+        np.random.shuffle(labels[i])
+        tr_idxs.append(labels[i][:num_ex])
+        val_idxs.append(labels[i][num_ex:num_ex+10])
+        test_idxs.append(labels[i][num_ex+10:num_ex+100])
+    
+    tr_idxs = np.concatenate(tr_idxs)
+    val_idxs = np.concatenate(val_idxs)
+    test_idxs = np.concatenate(test_idxs)
+    
+    # Create datasets compatible with timm's create_loader
+    dataset_train = CIFAR100CDataset(
+        x_corr[tr_idxs], 
+        y_corr[tr_idxs], 
+        is_training=True,
+        # Additional timm expected attributes
+        split='train',
+        root=args.data_root,
+        batch_size=getattr(args, 'batch_size', 128),
+        repeats=getattr(args, 'epoch_repeats', 0)
+    )
+    
+    dataset_val = CIFAR100CDataset(
+        x_corr[val_idxs], 
+        y_corr[val_idxs], 
+        is_training=False,
+        # Additional timm expected attributes
+        split='val',
+        root=args.data_root,
+        batch_size=getattr(args, 'batch_size', 128)
+    )
+    
+    dataset_test = CIFAR100CDataset(
+        x_corr[test_idxs], 
+        y_corr[test_idxs], 
+        is_training=False,
+        # Additional timm expected attributes
+        split='test',
+        root=args.data_root,
+        batch_size=getattr(args, 'batch_size', 128)
+    )
+    
+    return dataset_train, dataset_val, dataset_test
+
 class CustomVisionDataset(torchvision.datasets.VisionDataset):
     def __init__(self, tensor_dataset, transform=None, target_transform=None):
         super(CustomVisionDataset, self).__init__(root=None, transform=transform, target_transform=target_transform)
@@ -214,9 +371,9 @@ def build_imagenetc_dataset(args):
     for i in range(len(labels.keys())):
         np.random.shuffle(labels[i])
         tr_idxs.append(labels[i][:num_ex])
-        val_idxs.append(labels[i][num_ex:num_ex+10])
+        val_idxs.append(labels[i][num_ex:num_ex+5])
         # tr_idxs.append(labels[i][:num_ex+10])
-        test_idxs.append(labels[i][num_ex+10:num_ex+20])
+        test_idxs.append(labels[i][num_ex+5:num_ex+10])
     tr_idxs = np.concatenate(tr_idxs)
     val_idxs = np.concatenate(val_idxs)
     test_idxs = np.concatenate(test_idxs)

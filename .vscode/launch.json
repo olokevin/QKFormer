@@ -15,7 +15,8 @@
       // "cwd": "${workspaceFolder}/cifar100",
       "args": [
         "-c", "ZO.yml",
-        "--debug"
+        "--debug",
+        // "--eval"
       ]
     },
   ]

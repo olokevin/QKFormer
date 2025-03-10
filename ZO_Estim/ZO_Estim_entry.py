@@ -73,8 +73,9 @@ def build_ZO_Estim(config, model):
             
             for layer_name, layer in model.named_modules():
                 # if type(layer) in (RealQuantLinear,):
-                if layer.weight.requires_grad:
-                    splited_layer_list.append(SplitedLayer(idx=-1, name=layer_name, layer=layer))
+                if type(layer) in (nn.Linear, nn.Conv2d):
+                    if layer.weight.requires_grad:
+                        splited_layer_list.append(SplitedLayer(idx=-1, name=layer_name, layer=layer))
 
         #     if config.actv_perturb_block_idx_list == 'all':
         #         actv_perturb_block_idx_list = list(range(len(split_modules_list)))
@@ -159,8 +160,8 @@ def build_ZO_Estim(config, model):
 def build_obj_fn(obj_fn_type, **kwargs):
     if obj_fn_type == 'classifier':
         obj_fn = build_obj_fn_classifier(**kwargs)
-    elif obj_fn_type == 'classifier_layerwise':
-        obj_fn = build_obj_fn_classifier_layerwise(**kwargs)
+    elif obj_fn_type == 'qkformer_qzo':
+        obj_fn = build_obj_fn_qkformer_qzo(**kwargs)
     else:
         raise NotImplementedError
     return obj_fn
@@ -182,56 +183,33 @@ def build_obj_fn_classifier(data, target, model, criterion):
     
     return _obj_fn
 
-def build_obj_fn_classifier_layerwise(data, target, model, criterion):
-    ZO_iterable_block_name = getattr(model, 'ZO_iterable_block_name', None)
-    ZO_pre_block_forward = getattr(model, 'ZO_pre_block_forward', None)
-    ZO_post_block_forward = getattr(model, 'ZO_post_block_forward', None)
-    
-    split_modules_list = split_model(model, ZO_iterable_block_name)
+def build_obj_fn_qkformer_qzo(data, target, model, criterion):
     
     # if no attribute for _obj_fn: same as build_obj_fn_classifier
-    def _obj_fn(starting_idx=0, ending_idx=None, input=None, return_loss_reduction='mean', detach_idx=None):
-        if ending_idx == None:
-            ending_idx = len(split_modules_list)
-
-        if starting_idx == 0:
-            y = data
-            ### ZO_pre_block_forward when start from image input
-            if ZO_pre_block_forward is not None:
-                with torch.cuda.amp.autocast():
-                    y = ZO_pre_block_forward(y)
-        else:
-            assert input is not None
-            y = input
-        
-        # if input is not None:
-        #     y = input
-        # else:
-        #     assert starting_idx == 0
-        #     y = data
-        #     ### ZO_pre_block_forward when start from image input
-        #     if ZO_pre_block_forward is not None:
-        #         y = ZO_pre_block_forward(y)
-        
-        if detach_idx is not None and detach_idx < 0:
-            detach_idx = len(split_modules_list) + detach_idx
-        
+    def _obj_fn(return_loss_reduction='mean'):
         with torch.cuda.amp.autocast():
-            for i in range(starting_idx, ending_idx):
-                y = split_modules_list[i](y)
-                if detach_idx is not None and i == detach_idx:
-                    y = y.detach()
-                    y.requires_grad = True
-           
-        if return_loss_reduction == 'no_loss':
-            return y
+            y = (data.unsqueeze(0)).repeat(model.T, 1, 1, 1, 1)
+            y = model.forward_features(y)
+            y = y.mean(0)
+        
+        if return_loss_reduction == 'pzo':
+            y = y.detach()
+            y.requires_grad = True 
+            
+            with torch.cuda.amp.autocast():
+                outputs = model.head(y)
+                loss = criterion(outputs, target)
+                loss.backward()
+            
+            return y.detach(), y.grad.detach(), outputs, loss
+        
+        elif return_loss_reduction == 'pzo_nograd':
+            return y.detach()
+          
         else:
-            ### ZO_post_block_forward when end at classifier head
-            if ending_idx == len(split_modules_list):
-                if ZO_post_block_forward is not None:
-                    with torch.cuda.amp.autocast():
-                        y = ZO_post_block_forward(y)
-                    
+            with torch.cuda.amp.autocast():
+                y = model.head(y)    
+               
             if return_loss_reduction == 'mean':
                 criterion.reduction = 'mean'
                 return y, criterion(y, target)

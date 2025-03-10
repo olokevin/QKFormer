@@ -321,6 +321,9 @@ parser.add_argument('--eval', action='store_true',
 parser.add_argument('--debug', action='store_true',
                         help='ZO debug')
 
+parser.add_argument('--corruption_type', default='', type=str,
+                        help='corruption_type')
+
 
 def _parse_args():
     # Do we have a config file to parse?
@@ -351,7 +354,7 @@ def main():
         os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
         
         if args.config:
-            run_dir_config_path = os.path.join(args.output_dir, "args.yml")
+            run_dir_config_path = os.path.join(args.output_dir, "raw.yml")
             os.makedirs(os.path.dirname(run_dir_config_path), exist_ok=True)
             shutil.copyfile(args.config, run_dir_config_path)
             
@@ -359,7 +362,7 @@ def main():
     logger.init(args)  # dump exp config
     logger.info(os.getpid())
     _logger = logger
-
+    
     if args.log_wandb:
         if has_wandb:
             wandb.init(project=args.experiment, config=args)
@@ -403,6 +406,10 @@ def main():
                         "Install NVIDA apex or upgrade to PyTorch 1.6")
 
     random_seed(args.seed, args.rank)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.cuda.manual_seed_all(args.seed)
 
     import model
 
@@ -619,6 +626,21 @@ def main():
         crop_pct=data_config['crop_pct'],
         pin_memory=args.pin_mem,
     )
+    
+    loader_test = create_loader(
+        dataset_test,
+        input_size=data_config['input_size'],
+        batch_size=args.val_batch_size,
+        is_training=False,
+        use_prefetcher=args.prefetcher,
+        interpolation=data_config['interpolation'],
+        mean=data_config['mean'],
+        std=data_config['std'],
+        num_workers=args.workers,
+        distributed=args.distributed,
+        crop_pct=data_config['crop_pct'],
+        pin_memory=args.pin_mem,
+    )
 
     # setup loss function
     if args.jsd:
@@ -632,13 +654,6 @@ def main():
     else:
         train_loss_fn = nn.CrossEntropyLoss().cuda()
     validate_loss_fn = nn.CrossEntropyLoss().cuda()
-    
-    
-    ##### eval
-    if args.eval:
-        eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
-        _logger.info(f"Accuracy of the network on the {len(dataset_eval)} test images: {eval_metrics['top1']:.2f}%")
-        exit(0)
 
     # setup checkpoint saver and eval metric tracking
     eval_metric = args.eval_metric
@@ -684,7 +699,7 @@ def main():
         if param.requires_grad:
             print(name)
     n_trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info('number of trainable params (M): %.2f' % (n_trainable_parameters / 1.e6))
+    logger.info('number of trainable params: %d' % (n_trainable_parameters))
 
     ############### ZO Estim ################
     if hasattr(args, 'ZO_Estim'):
@@ -695,6 +710,12 @@ def main():
             ZO_Estim = None
     else:
         ZO_Estim = None
+    
+    ############### eval ################
+    eval_metrics = validate(model, loader_test, validate_loss_fn, args, amp_autocast=amp_autocast)
+    _logger.info(f"Initial Accuracy of the network on the {len(dataset_test)} test images: {eval_metrics['top1']:.2f}%")
+    if args.eval:
+        exit(0)
     
     try:
         for epoch in range(start_epoch, num_epochs):
@@ -737,12 +758,24 @@ def main():
                 # _logger.info('Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
             
             _logger.info(f"epoch {epoch} train_loss {train_metrics['loss']:.3f} val_top1 {eval_metrics['top1']:.3f} Best_top1 {best_metric:.3f} at epoch {best_epoch}")
+            
+        if best_metric is not None:
+            _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
+        
+            # Load the best model
+            best_checkpoint_path = os.path.join(args.output_dir, f'checkpoint-{best_epoch}.pth.tar')
+            if os.path.exists(best_checkpoint_path):
+                _logger.info(f"Loading best model from epoch {best_epoch} with path {best_checkpoint_path}")
+                load_checkpoint(model, best_checkpoint_path)
+                eval_metrics = validate(model, loader_test, validate_loss_fn, args, amp_autocast=amp_autocast)
+                _logger.info(f"Final Accuracy of the network on the {len(dataset_test)} test images: {eval_metrics['top1']:.2f}%")
+        else:
+            _logger.warning(f"Best checkpoint not found at {best_checkpoint_path}")
 
     except KeyboardInterrupt:
         pass
-    if best_metric is not None:
-        _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
-
+    # if best_metric is not None:
+    #     _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
 
 def train_one_epoch(
         epoch, model, loader, optimizer, loss_fn, args,
@@ -790,9 +823,11 @@ def train_one_epoch(
             optimizer.zero_grad()
             obj_fn = build_obj_fn(ZO_Estim.obj_fn_type, data=input, target=target, model=model, criterion=loss_fn)
             ZO_Estim.update_obj_fn(obj_fn)
-            with torch.no_grad():
-                output, loss = obj_fn()
-                ZO_Estim.estimate_grad(old_loss=loss)
+            # with torch.no_grad():
+            #     output, loss = obj_fn()
+            #     ZO_Estim.estimate_grad(old_loss=loss)
+            
+            output, loss = ZO_Estim.estimate_grad()
                 
             ### pseudo NP
             if ZO_Estim.splited_layer_list is not None:
@@ -849,7 +884,6 @@ def train_one_epoch(
                     if param.requires_grad:
                         print(f'{torch.linalg.norm(param.ZO_grad.view(-1)) / torch.linalg.norm(param.FO_grad.view(-1))}')
                 
-                optimizer.zero_grad()
             
             if not args.distributed:
                 losses_m.update(loss.item(), input.size(0))

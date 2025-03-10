@@ -40,7 +40,18 @@ from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler
 from timm.utils import ApexScaler, NativeScaler
 
-
+##### ZO
+from pathlib import Path
+import shutil
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "..")))
+from imagenet.util.logging import logger
+from imagenet.util.datasets import build_cifar100c_dataset
+import easydict
+from ZO_Estim.ZO_Estim_entry import build_ZO_Estim
+import torch.nn.functional as F
+from ZO_Estim.ZO_Estim_entry import build_obj_fn
+from ZO_Estim.ZO_utils import default_create_bwd_pre_hook_ZO_grad
 
 try:
     from apex import amp
@@ -270,7 +281,7 @@ parser.add_argument('--log-interval', type=int, default=1000, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('--recovery-interval', type=int, default=0, metavar='N',
                     help='how many batches to wait before writing recovery checkpoint')
-parser.add_argument('--checkpoint-hist', type=int, default=10, metavar='N',
+parser.add_argument('--checkpoint-hist', type=int, default=1, metavar='N',
                     help='number of checkpoints to keep (default: 10)')
 parser.add_argument('-j', '--workers', type=int, default=4, metavar='N',
                     help='how many training processes to use (default: 1)')
@@ -288,7 +299,7 @@ parser.add_argument('--pin-mem', action='store_true', default=False,
                     help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
 parser.add_argument('--no-prefetcher', action='store_true', default=False,
                     help='disable fast prefetcher')
-parser.add_argument('--output', default='', type=str, metavar='PATH',
+parser.add_argument('--output', default='output/train', type=str, metavar='PATH',
                     help='path to output folder (default: none, current dir)')
 parser.add_argument('--experiment', default='', type=str, metavar='NAME',
                     help='name of train experiment, name of sub-folder for output')
@@ -304,6 +315,15 @@ parser.add_argument('--torchscript', dest='torchscript', action='store_true',
 parser.add_argument('--log-wandb', action='store_true', default=False,
                     help='log training and validation metrics to wandb')
 
+parser.add_argument('--eval', action='store_true',
+                        help='Perform evaluation only')
+
+parser.add_argument('--debug', action='store_true',
+                        help='ZO debug')
+
+parser.add_argument('--corruption_type', default='', type=str,
+                        help='corruption_type')
+
 
 def _parse_args():
     # Do we have a config file to parse?
@@ -316,6 +336,8 @@ def _parse_args():
     # The main arg parser parses the rest of the args, the usual
     # defaults will have been overridden if config file specified.
     args = parser.parse_args(remaining)
+    
+    args.config = args_config.config
 
     # Cache the args as a text string to save them in the output dir later
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
@@ -323,9 +345,24 @@ def _parse_args():
 
 
 def main():
-    setup_default_logging()
+    # setup_default_logging()
     args, args_text = _parse_args()
-
+    
+    # Setup logger
+    if args.output:
+        args.output_dir = os.path.join(args.output, str(os.getpid()))
+        os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
+        
+        if args.config:
+            run_dir_config_path = os.path.join(args.output_dir, "raw.yml")
+            os.makedirs(os.path.dirname(run_dir_config_path), exist_ok=True)
+            shutil.copyfile(args.config, run_dir_config_path)
+            
+    args.run_dir = args.output_dir
+    logger.init(args)  # dump exp config
+    logger.info(os.getpid())
+    _logger = logger
+    
     if args.log_wandb:
         if has_wandb:
             wandb.init(project=args.experiment, config=args)
@@ -369,6 +406,10 @@ def main():
                         "Install NVIDA apex or upgrade to PyTorch 1.6")
 
     random_seed(args.seed, args.rank)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.cuda.manual_seed_all(args.seed)
 
     import model
 
@@ -384,6 +425,15 @@ def main():
         depths=args.layer, sr_ratios=1,
         T=args.time_step
    )
+    
+    ####### load pretrained model #######
+    if args.initial_checkpoint:
+        checkpoint = torch.load(args.initial_checkpoint, map_location='cpu')
+        logger.info("Load pre-trained checkpoint from: %s" % args.initial_checkpoint)
+        checkpoint_model = checkpoint['state_dict']
+        # load pre-trained model
+        msg = model.load_state_dict(checkpoint_model, strict=False)
+        logger.info(msg)
 
 
     print("Creating model")
@@ -500,13 +550,16 @@ def main():
         _logger.info('Scheduled epochs: {}'.format(num_epochs))
 
     # create the train and eval datasets
-    dataset_train = create_dataset(
-        args.dataset,
-        root=args.data_dir, split=args.train_split, is_training=True,
-        batch_size=args.batch_size, repeats=args.epoch_repeats)
+    if args.dataset == 'cifar100-c':
+        dataset_train, dataset_eval, dataset_test = build_cifar100c_dataset(args=args)
+    else:
+        dataset_train = create_dataset(
+            args.dataset,
+            root=args.data_dir, split=args.train_split, is_training=True,
+            batch_size=args.batch_size, repeats=args.epoch_repeats)
 
-    dataset_eval = create_dataset(
-        args.dataset, root=args.data_dir, split=args.val_split, is_training=False, batch_size=args.batch_size)
+        dataset_eval = create_dataset(
+            args.dataset, root=args.data_dir, split=args.val_split, is_training=False, batch_size=args.batch_size)
 
     # setup mixup / cutmix
     collate_fn = None
@@ -573,6 +626,21 @@ def main():
         crop_pct=data_config['crop_pct'],
         pin_memory=args.pin_mem,
     )
+    
+    loader_test = create_loader(
+        dataset_test,
+        input_size=data_config['input_size'],
+        batch_size=args.val_batch_size,
+        is_training=False,
+        use_prefetcher=args.prefetcher,
+        interpolation=data_config['interpolation'],
+        mean=data_config['mean'],
+        std=data_config['std'],
+        num_workers=args.workers,
+        distributed=args.distributed,
+        crop_pct=data_config['crop_pct'],
+        pin_memory=args.pin_mem,
+    )
 
     # setup loss function
     if args.jsd:
@@ -592,24 +660,63 @@ def main():
     best_metric = None
     best_epoch = None
     saver = None
-    output_dir = None
+    # output_dir = None
     if args.rank == 0:
-        if args.experiment:
-            exp_name = args.experiment
-        else:
-            exp_name = '-'.join([
-                datetime.now().strftime("%Y%m%d-%H%M%S"),
-                safe_model_name(args.model),
-                str(data_config['input_size'][-1])
-            ])
-        output_dir = get_outdir(args.output if args.output else './output/train', exp_name)
+        # if args.experiment:
+        #     exp_name = args.experiment
+        # else:
+        #     exp_name = '-'.join([
+        #         datetime.now().strftime("%Y%m%d-%H%M%S"),
+        #         safe_model_name(args.model),
+        #         str(data_config['input_size'][-1])
+        #     ])
+        # output_dir = get_outdir(args.output if args.output else './output/train', exp_name)
         decreasing = True if eval_metric == 'loss' else False
         saver = CheckpointSaver(
             model=model, optimizer=optimizer, args=args, model_ema=model_ema, amp_scaler=loss_scaler,
-            checkpoint_dir=output_dir, recovery_dir=output_dir, decreasing=decreasing, max_history=args.checkpoint_hist)
-        with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
+            checkpoint_dir=args.output_dir, recovery_dir=args.output_dir, decreasing=decreasing, max_history=args.checkpoint_hist)
+        with open(os.path.join(args.output_dir, 'args.yaml'), 'w') as f:
             f.write(args_text)
 
+    ############### Trainable Params ################
+    # for name, module in model.named_modules():
+    #     print(name, type(module))
+    
+    if hasattr(args, 'trainable_block_list'):
+        trainable_block_list = args.trainable_block_list
+        
+        for name, param in model.named_parameters():
+            if any([block in name for block in trainable_block_list]):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+            
+            if getattr(args, 'no_train_bn', False):
+                if '_bn' in name:
+                    param.requires_grad = False
+    
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(name)
+    n_trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info('number of trainable params: %d' % (n_trainable_parameters))
+
+    ############### ZO Estim ################
+    if hasattr(args, 'ZO_Estim'):
+        args.ZO_Estim = easydict.EasyDict(args.ZO_Estim)
+        if args.ZO_Estim.en:
+            ZO_Estim = build_ZO_Estim(args.ZO_Estim, model=model, )
+        else:
+            ZO_Estim = None
+    else:
+        ZO_Estim = None
+    
+    ############### eval ################
+    eval_metrics = validate(model, loader_test, validate_loss_fn, args, amp_autocast=amp_autocast)
+    _logger.info(f"Initial Accuracy of the network on the {len(dataset_test)} test images: {eval_metrics['top1']:.2f}%")
+    if args.eval:
+        exit(0)
+    
     try:
         for epoch in range(start_epoch, num_epochs):
             if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
@@ -617,8 +724,8 @@ def main():
 
             train_metrics = train_one_epoch(
                 epoch, model, loader_train, optimizer, train_loss_fn, args,
-                lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
-                amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn)
+                lr_scheduler=lr_scheduler, saver=saver, output_dir=args.output_dir,
+                amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn, ZO_Estim=ZO_Estim)
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
                 if args.local_rank == 0:
@@ -639,27 +746,41 @@ def main():
                 # step LR for next epoch
                 lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
 
-            if output_dir is not None:
+            if args.output_dir is not None:
                 update_summary(
-                    epoch, train_metrics, eval_metrics, os.path.join(output_dir, 'summary.csv'),
+                    epoch, train_metrics, eval_metrics, os.path.join(args.output_dir, 'summary.csv'),
                     write_header=best_metric is None, log_wandb=args.log_wandb and has_wandb)
 
             if saver is not None:
                 # save proper checkpoint with eval metric
                 save_metric = eval_metrics[eval_metric]
                 best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
-                _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
+                # _logger.info('Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
+            
+            _logger.info(f"epoch {epoch} train_loss {train_metrics['loss']:.3f} val_top1 {eval_metrics['top1']:.3f} Best_top1 {best_metric:.3f} at epoch {best_epoch}")
+            
+        if best_metric is not None:
+            _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
+        
+            # Load the best model
+            best_checkpoint_path = os.path.join(args.output_dir, f'checkpoint-{best_epoch}.pth.tar')
+            if os.path.exists(best_checkpoint_path):
+                _logger.info(f"Loading best model from epoch {best_epoch} with path {best_checkpoint_path}")
+                load_checkpoint(model, best_checkpoint_path)
+                eval_metrics = validate(model, loader_test, validate_loss_fn, args, amp_autocast=amp_autocast)
+                _logger.info(f"Final Accuracy of the network on the {len(dataset_test)} test images: {eval_metrics['top1']:.2f}%")
+        else:
+            _logger.warning(f"Best checkpoint not found at {best_checkpoint_path}")
 
     except KeyboardInterrupt:
         pass
-    if best_metric is not None:
-        _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
-
+    # if best_metric is not None:
+    #     _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
 
 def train_one_epoch(
         epoch, model, loader, optimizer, loss_fn, args,
         lr_scheduler=None, saver=None, output_dir=None, amp_autocast=suppress,
-        loss_scaler=None, model_ema=None, mixup_fn=None):
+        loss_scaler=None, model_ema=None, mixup_fn=None, ZO_Estim=None):
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if args.prefetcher and loader.mixup_enabled:
             loader.mixup_enabled = False
@@ -672,6 +793,18 @@ def train_one_epoch(
     losses_m = AverageMeter()
 
     model.train()
+    
+    # Freeze all BatchNorm layers
+    if getattr(args, 'freeze_bn', False):
+        for module in model.modules():
+            if isinstance(module, torch.nn.BatchNorm2d) or isinstance(module, torch.nn.BatchNorm1d):
+                module.eval()
+    
+    # Freeze all dropout layers
+    if ZO_Estim is not None:
+      for module in model.modules():
+        if isinstance(module, torch.nn.Dropout):
+          module.eval()
 
     end = time.time()
     last_idx = len(loader) - 1
@@ -685,29 +818,101 @@ def train_one_epoch(
                 input, target = mixup_fn(input, target)
         if args.channels_last:
             input = input.contiguous(memory_format=torch.channels_last)
+        
+        if ZO_Estim is not None:
+            optimizer.zero_grad()
+            obj_fn = build_obj_fn(ZO_Estim.obj_fn_type, data=input, target=target, model=model, criterion=loss_fn)
+            ZO_Estim.update_obj_fn(obj_fn)
+            # with torch.no_grad():
+            #     output, loss = obj_fn()
+            #     ZO_Estim.estimate_grad(old_loss=loss)
+            
+            output, loss = ZO_Estim.estimate_grad()
+                
+            ### pseudo NP
+            if ZO_Estim.splited_layer_list is not None:
+                # bwd_pre_hook_list = []
+                # for splited_layer in ZO_Estim.splited_layer_list:
+                #     create_bwd_pre_hook_ZO_grad = getattr(splited_layer.layer, 'create_bwd_pre_hook_ZO_grad', default_create_bwd_pre_hook_ZO_grad)
+                #     bwd_pre_hook_list.append(splited_layer.layer.register_full_backward_pre_hook(create_bwd_pre_hook_ZO_grad(splited_layer.layer.ZO_grad_output, args.debug)))
+                # output = model(data)
+                # loss = criterion(output, target)
+                # loss.backward()
+                
+                # for bwd_pre_hook in bwd_pre_hook_list:
+                #     bwd_pre_hook.remove()
+                
+                fwd_hook_list = []
+                for splited_layer in ZO_Estim.splited_layer_list:
 
-        with amp_autocast():
-            output = model(input)
-            loss = loss_fn(output, target)
+                    fwd_hook_get_param_grad = splited_layer.layer.create_fwd_hook_get_param_grad(splited_layer.layer.ZO_grad_output, args.debug)
+                    fwd_hook_list.append(splited_layer.layer.register_forward_hook(fwd_hook_get_param_grad))
+                    
+                    with torch.no_grad():
+                        output = model(input)
+                        loss = loss_fn(output, target)
+                
+                for fwd_hook_handle in fwd_hook_list:
+                    fwd_hook_handle.remove()
+            
+            ### save param FO grad
+            if args.debug:
+                for param in model.parameters():
+                    if param.requires_grad:
+                        param.ZO_grad = param.grad.clone()
+                        
+                optimizer.zero_grad()
+                
+                output = model(input)
+                loss = loss_fn(output, target)
+                loss.backward()
+                
+                for param in model.parameters():
+                    if param.requires_grad:
+                        param.FO_grad = param.grad.clone()
+                
+                optimizer.zero_grad()
+            
+            ### print FO ZO grad
+                print('param cos sim')
+                for param in model.parameters():
+                    if param.requires_grad:
+                        print(f'{F.cosine_similarity(param.FO_grad.view(-1), param.ZO_grad.view(-1), dim=0)}')
+                    
+                print('param Norm ZO/FO: ')
+                for param in model.parameters():
+                    if param.requires_grad:
+                        print(f'{torch.linalg.norm(param.ZO_grad.view(-1)) / torch.linalg.norm(param.FO_grad.view(-1))}')
+                
+            
+            if not args.distributed:
+                losses_m.update(loss.item(), input.size(0))
 
-        if not args.distributed:
-            losses_m.update(loss.item(), input.size(0))
-
-        optimizer.zero_grad()
-        if loss_scaler is not None:
-            loss_scaler(
-                loss, optimizer,
-                clip_grad=args.clip_grad, clip_mode=args.clip_mode,
-                parameters=model_parameters(model, exclude_head='agc' in args.clip_mode),
-                create_graph=second_order)
-        else:
-            # loss.backward()
-            loss.backward(create_graph=second_order)
-            if args.clip_grad is not None:
-                dispatch_clip_grad(
-                    model_parameters(model, exclude_head='agc' in args.clip_mode),
-                    value=args.clip_grad, mode=args.clip_mode)
             optimizer.step()
+        
+        else:
+            with amp_autocast():
+                output = model(input)
+                loss = loss_fn(output, target)
+
+            if not args.distributed:
+                losses_m.update(loss.item(), input.size(0))
+
+            optimizer.zero_grad()
+            if loss_scaler is not None:
+                loss_scaler(
+                    loss, optimizer,
+                    clip_grad=args.clip_grad, clip_mode=args.clip_mode,
+                    parameters=model_parameters(model, exclude_head='agc' in args.clip_mode),
+                    create_graph=second_order)
+            else:
+                # loss.backward()
+                loss.backward(create_graph=second_order)
+                if args.clip_grad is not None:
+                    dispatch_clip_grad(
+                        model_parameters(model, exclude_head='agc' in args.clip_mode),
+                        value=args.clip_grad, mode=args.clip_mode)
+                optimizer.step()
 
         functional.reset_net(model)
 

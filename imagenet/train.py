@@ -194,14 +194,20 @@ def main(args):
     seed = args.seed + misc.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
+    
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.cuda.manual_seed_all(seed)
 
-    cudnn.benchmark = True
+    # cudnn.benchmark = True
 
     if args.dataset == 'imagenet-c':
         dataset_train, dataset_val, dataset_test = build_imagenetc_dataset(args=args)
     else:
         dataset_train = build_dataset(is_train=True, args=args)
         dataset_val = build_dataset(is_train=False, args=args)
+        dataset_test = None
 
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()
@@ -245,6 +251,15 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=False
     )
+    
+    if dataset_test is not None:
+        data_loader_test = torch.utils.data.DataLoader(
+            dataset_test, sampler=sampler_val,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_mem,
+            drop_last=False
+        )
 
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
@@ -306,7 +321,7 @@ def main(args):
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
 
     if args.lr is None:  # only base_lr is specified
-        args.lr = args.blr * eff_batch_size / 256
+        args.lr = float(args.blr) * eff_batch_size / 256
 
     logger.info("base lr: %.2e" % (args.lr * 256 / eff_batch_size))
     logger.info("actual lr: %.2e" % args.lr)
@@ -338,12 +353,7 @@ def main(args):
 
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
-    if args.eval:
-        test_stats = evaluate(data_loader_val, model, device)
-        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        exit(0)
-    
-    ############### Trainable Params ################
+    ############### Trainable params ################
     # for name, module in model.named_modules():
     #     print(name, type(module))
     
@@ -361,7 +371,7 @@ def main(args):
                     param.requires_grad = False
     
     n_trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info('number of trainable params (M): %.2f' % (n_trainable_parameters / 1.e6))
+    logger.info('number of trainable params: %.2f' % (n_trainable_parameters))
 
     ############### ZO Estim ################
     if hasattr(args, 'ZO_Estim'):
@@ -373,13 +383,18 @@ def main(args):
     else:
         ZO_Estim = None
     
-    ############### Training ################
-    # test_stats = evaluate(data_loader_val, model, device)
-    # logger.info(f"Initialization Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+    ############### eval ################
+    test_stats = evaluate(data_loader_test, model, device)
+    logger.info(f"Initial Accuracy of the network on the {len(dataset_test)} test images: {test_stats['acc1']:.1f}%")
     
+    if args.eval:
+        exit(0)
+
+    ############### Training ################    
     logger.info(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     max_accuracy = 0.0
+    
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
@@ -393,16 +408,19 @@ def main(args):
         )
         
         test_stats = evaluate(data_loader_val, model, device)
-        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        # logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
 
-        if epoch > int(args.epochs - 20) and test_stats["acc1"] > max_accuracy:
+        # if epoch > int(args.epochs - 20) and test_stats["acc1"] > max_accuracy:
+        if test_stats["acc1"] > max_accuracy:
             if args.output_dir:
                 misc.save_model(
                     args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                    loss_scaler=loss_scaler, epoch=epoch)
+                    loss_scaler=loss_scaler, epoch=epoch, best_ckpt=True)
 
         max_accuracy = max(max_accuracy, test_stats["acc1"])
-        logger.info(f'Max accuracy: {max_accuracy:.2f}%')
+        # logger.info(f'Max accuracy: {max_accuracy:.2f}%')
+        
+        logger.info(f"Epoch {epoch} Accuracy of the network on the {len(dataset_val)} validation images: {test_stats['acc1']:.1f}% Max accuracy: {max_accuracy:.2f}%")
 
         if log_writer is not None:
             log_writer.add_scalar('perf/test_acc1', test_stats['acc1'], epoch)
@@ -423,6 +441,19 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info('Training time {}'.format(total_time_str))
+    
+    ############### eval ################
+    # Load the best model
+    best_checkpoint_path = os.path.join(args.output_dir, 'checkpoint-best.pth')
+    if os.path.exists(best_checkpoint_path):
+        checkpoint = torch.load(best_checkpoint_path, map_location='cpu')
+        logger.info("Load best checkpoint from: %s" % best_checkpoint_path)
+        model.load_state_dict(checkpoint['model'])
+    else:
+        logger.info("Best checkpoint not found at: %s" % best_checkpoint_path)
+        
+    test_stats = evaluate(data_loader_test, model, device)
+    logger.info(f"Final Accuracy of the network on the {len(dataset_test)} test images: {test_stats['acc1']:.1f}%")
 
 
 if __name__ == '__main__':
