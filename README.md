@@ -22,7 +22,7 @@ CIFAR-10-C, CIFAR-100-C, ImageNet-C datasets will be automatically downloaded on
 We have provided our pre-trained model on CIFAR-10 and CIFAR-100. For model pretrained on ImageNet, please download the 82.04 accuracy model from https://drive.google.com/drive/folders/1vhq9jmhmuyZ5_RGHuWD4wniza856qF8U?usp=drive_link and place under imagenet/ folder.
 
 ## Train & Test
-### tABLE i
+### Table I
 ```
 cd cifar10
 bash table_1.sh
